@@ -2,7 +2,8 @@
 
 A small macOS background helper that makes the "HTX HID Device" USB touchpad usable on a Mac.
 
-The device is USB `048D:8911` with the serial `MIIX320_HTK_V7T_HTP`; its firmware appears to come from a Lenovo Miix 320 keyboard dock.
+The pad is [this one on Amazon](https://www.amazon.com/dp/B0BDLJXBS9).
+It identifies itself as USB `048D:8911` with the serial `MIIX320_HTK_V7T_HTP`; its firmware appears to come from a Lenovo Miix 320 keyboard dock.
 
 ## Why this exists
 
@@ -30,12 +31,21 @@ This helper switches the pad to Precision Touchpad mode, reads the finger report
 | Three-finger swipe left or right | Move to the Space on the right or left |
 
 The pad has no physical button.
+Gestures outside this table, such as rotating, smart zoom, and anything with four or more fingers, are not supported.
 
 Three-finger swipes send the same Dock gesture events as Apple's trackpads, so Spaces and Mission Control follow the fingers and hold wherever they stop.
 Lifting finishes the swipe, unless the fingers were heading back toward where they started, which snaps it back.
 These events come from private macOS functions.
 If an update removes them, swipes fall back to the Mission Control keyboard shortcuts (Control with an arrow key), fired once the fingers travel 10 mm, with no animation following the fingers.
 That fallback needs the shortcuts enabled in System Settings → Keyboard → Keyboard Shortcuts → Mission Control.
+
+## Requirements
+
+- macOS; developed and tested on macOS 27.2.1 on a 14-inch MacBook Pro with Apple silicon (Mac16,8).
+- The Xcode Command Line Tools, for `make` and `clang`: `xcode-select --install`.
+- For touches, a built-in trackpad or a Magic Trackpad; see [Touches](#touches).
+
+Three-finger swipes and touches use private macOS functions, so a macOS update could break them; [Troubleshooting](#troubleshooting) shows how to tell.
 
 ## Install
 
@@ -116,10 +126,30 @@ AppKit accepts trackpad touches only from a multitouch device it knows, so they 
 - `make log` shows the end of `~/Library/Logs/htx-touchpad.log`.
 - `make uninstall` stops the helper and removes the installed files; remove the two Privacy & Security entries by hand.
 
+## Troubleshooting
+
+Every start of the helper logs a line like this one, which `make log` shows:
+
+```text
+started: speed 1.00, verbose: no, accessibility: yes, input monitoring: yes, dock swipes: yes, touches: yes, HID manager open: 0x00000000
+```
+
+- `accessibility: no` or `input monitoring: no` means that permission is missing; see [Install](#install).
+- `dock swipes: no` means the private swipe functions are gone, so three-finger swipes use the keyboard-shortcut fallback.
+- `touches: no` means the private touch functions are gone or there is no built-in trackpad or Magic Trackpad, so the helper sends no touches.
+
+Connecting the pad logs `touchpad connected; switching to touchpad mode: 0x00000000`, where any code other than zero means the switch failed.
+
 ## Keyboard Setup Assistant
 
-The device also exposes a keyboard interface, which makes macOS open Keyboard Setup Assistant on first connection.
-It is registered as an ANSI keyboard (`"35089-1165-0" = 40` in `/Library/Preferences/com.apple.keyboardtype.plist`), so the assistant stays away.
+The pad also exposes a keyboard interface, which makes macOS open Keyboard Setup Assistant on first connection.
+To keep it away, register that interface as an ANSI keyboard (type 40) once:
+
+```sh
+sudo defaults write /Library/Preferences/com.apple.keyboardtype.plist keyboardtype -dict-add 35089-1165-0 -int 40
+```
+
+The key is the product ID and the vendor ID in decimal (`0x8911` is 35089 and `0x048D` is 1165), followed by 0.
 
 ## Touch report layout
 
@@ -132,3 +162,7 @@ Input report 4 is 30 bytes long:
 - Bytes 26–27: scan time.
 - Byte 28: contact count.
 - Byte 29: buttons.
+
+## License
+
+MIT; see [LICENSE](LICENSE).
