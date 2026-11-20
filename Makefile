@@ -1,4 +1,4 @@
-NAME = htx-touchpad
+NAME = htx-trackpad
 LABEL = xyz.attacktive.$(NAME)
 PREFIX ?= $(HOME)/.local
 SPEED ?= 1.0

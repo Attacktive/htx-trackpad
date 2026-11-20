@@ -1,4 +1,4 @@
-# htx-touchpad
+# htx-trackpad
 
 A small macOS background helper that makes the "HTX HID Device" USB touchpad usable on a Mac.
 
@@ -55,9 +55,9 @@ make install            # or: make install SPEED=1.2 VERBOSE=1
 
 `VERBOSE=1` logs every touch: taps, drags, scroll and momentum endings, and per-movement pointer statistics.
 
-This installs `~/.local/bin/htx-touchpad` and the login agent `~/Library/LaunchAgents/xyz.attacktive.htx-touchpad.plist`, then starts it.
+This installs `~/.local/bin/htx-trackpad` and the login agent `~/Library/LaunchAgents/xyz.attacktive.htx-trackpad.plist`, then starts it.
 
-Then grant two permissions in System Settings → Privacy & Security, adding `~/.local/bin/htx-touchpad` with **+** and **⌘⇧G** (not the copy in `build/`):
+Then grant two permissions in System Settings → Privacy & Security, adding `~/.local/bin/htx-trackpad` with **+** and **⌘⇧G** (not the copy in `build/`):
 
 - **Input Monitoring**, to read the pad.
 	The helper does not notice this grant while running, so run `make restart` afterwards.
@@ -123,7 +123,7 @@ AppKit accepts trackpad touches only from a multitouch device it knows, so they 
 ## Other targets
 
 - `make restart` restarts the helper.
-- `make log` shows the end of `~/Library/Logs/htx-touchpad.log`.
+- `make log` shows the end of `~/Library/Logs/htx-trackpad.log`.
 - `make uninstall` stops the helper and removes the installed files; remove the two Privacy & Security entries by hand.
 
 ## Troubleshooting
