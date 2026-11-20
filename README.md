@@ -19,8 +19,8 @@ This helper switches the pad to Precision Touchpad mode, reads the finger report
 | Gesture | Action |
 | --- | --- |
 | One finger | Move the pointer |
-| Tap | Left click (tap again quickly for a double click) |
-| Tap, then touch again and slide | Drag; after a lift the item stays held for a second, so touch again to keep dragging or tap to drop it |
+| Tap | Left click, a moment after the lift while tap-drag is on (tap again quickly for a double click) |
+| Tap, then touch again and slide | Drag, unless dragging is off in Accessibility settings; after a lift the item stays held for a second, so touch again to keep dragging or tap to drop it |
 | Two-finger tap | Right click |
 | Three-finger tap | Middle click |
 | Two-finger slide | Scroll, following the system's natural-scrolling setting; a flick keeps coasting after the lift until a touch stops it |
@@ -70,6 +70,16 @@ The pointer also follows the Trackpad "Tracking speed" slider in System Settings
 The slider's 0–3 range maps linearly onto a multiplier from 0.25 to 2.5, which is 1 at the 1.0 notch, applied to the whole curve along with `SPEED`.
 At 1.0 the curve matches Apple's; at other notches it is an approximation, since Apple's curve also changes shape.
 The add-on pad and the built-in trackpad share that one slider.
+
+## Tapping and dragging
+
+Taps copy the timing of Apple's trackpad with its dragging option on, measured on the same MacBook.
+A one-finger tap clicks 0.23 s after the lift, unless the finger lands again first.
+Landing again presses the button at once and holds it, so the drag that follows is a single press, which lets Mission Control drag a desktop instead of switching to it.
+Lifting quickly from that second touch completes a double click instead.
+
+This follows the trackpad's dragging option in Accessibility settings, read at the start of every touch.
+With it off, taps click right at the lift, and touching again only moves the pointer.
 
 ## Scrolling
 

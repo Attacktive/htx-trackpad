@@ -59,7 +59,8 @@ static const double COUNTS_PER_MM = 1599.0 / 117.1;
 
 static const double TAP_MAX_SECONDS = 0.25;
 static const double TAP_MAX_TRAVEL_MM = 2.0;
-static const double TAP_DRAG_WINDOW_SECONDS = 0.3;
+// Measured on the built-in trackpad with tap-drag on: a tap clicks this long after the lift, unless the finger lands again first.
+static const double TAP_DRAG_WINDOW_SECONDS = 0.23;
 static const double DOUBLE_CLICK_SECONDS = 0.5;
 static const double DRAG_LOCK_SECONDS = 1.0;
 static const double SWIPE_MIN_TRAVEL_MM = 10.0;
@@ -142,7 +143,7 @@ typedef struct {
 	double peakSpeed;
 	double pointerFingerTravel;
 	double pointerCursorTravel;
-	bool armedForDrag;
+	bool pressedAtLanding;
 	bool dragging;
 	bool referenceValid;
 	unsigned referenceMask;
@@ -173,6 +174,7 @@ typedef struct {
 	bool naturalScrolling;
 	bool momentumScrolling;
 	bool pinchZooming;
+	bool tapToDrag;
 	double trackingMultiplier;
 } Gesture;
 
@@ -211,6 +213,7 @@ static DockSwipeApi dockSwipeApi;
 static bool dockSwipesAvailable;
 static CGEventSourceRef eventSource;
 static CFRunLoopTimerRef dragReleaseTimer;
+static CFRunLoopTimerRef tapClickTimer;
 static IOHIDDeviceRef touchpad;
 static double speedFactor = 1.0;
 static bool verbose;
@@ -817,13 +820,36 @@ static void scheduleDragRelease(void) {
 	CFRunLoopAddTimer(CFRunLoopGetCurrent(), dragReleaseTimer, kCFRunLoopDefaultMode);
 }
 
-static void beginTouch(double time) {
-	stopMomentum("stopped by a touch");
-	if (gesture.dragging) {
-		cancelDragRelease();
-		logVerbose("drag resumed");
+static void cancelTapClick(void) {
+	if (!tapClickTimer) {
+		return;
 	}
 
+	CFRunLoopTimerInvalidate(tapClickTimer);
+	CFRelease(tapClickTimer);
+	tapClickTimer = NULL;
+}
+
+static void postTapClick(void) {
+	cancelTapClick();
+	click(kCGMouseButtonLeft, gesture.clickCount);
+	logVerbose("tap: left click (count %d)", gesture.clickCount);
+}
+
+static void onTapClickTimer(CFRunLoopTimerRef timer, void *info) {
+	// Another pointing device may have moved the pointer while the click waited.
+	syncCursor();
+	postTapClick();
+}
+
+static void scheduleTapClick(void) {
+	cancelTapClick();
+	tapClickTimer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + TAP_DRAG_WINDOW_SECONDS, 0, 0, 0, onTapClickTimer, NULL);
+	CFRunLoopAddTimer(CFRunLoopGetCurrent(), tapClickTimer, kCFRunLoopDefaultMode);
+}
+
+static void beginTouch(double time) {
+	stopMomentum("stopped by a touch");
 	gesture.touching = true;
 	gesture.touchStart = time;
 	gesture.maxFingers = 0;
@@ -843,14 +869,30 @@ static void beginTouch(double time) {
 	gesture.swipeX = 0;
 	gesture.swipeY = 0;
 	gesture.swiped = false;
-	gesture.armedForDrag = time - gesture.lastTapEnd <= TAP_DRAG_WINDOW_SECONDS;
+	gesture.pressedAtLanding = false;
 	CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
 	CFPreferencesAppSynchronize(CFSTR("com.apple.AppleMultitouchTrackpad"));
 	gesture.naturalScrolling = readNaturalScrolling();
 	gesture.momentumScrolling = readTrackpadOption(CFSTR("TrackpadMomentumScroll"));
 	gesture.pinchZooming = readTrackpadOption(CFSTR("TrackpadPinch"));
+	gesture.tapToDrag = readTrackpadOption(CFSTR("Dragging"));
 	gesture.trackingMultiplier = readTrackingMultiplier();
 	syncCursor();
+	if (gesture.dragging) {
+		cancelDragRelease();
+		logVerbose("drag resumed");
+	} else if (tapClickTimer) {
+		if (time - gesture.lastTapEnd <= TAP_DRAG_WINDOW_SECONDS) {
+			// As on Apple's trackpad, landing again presses at once, so a drag is one press from here and Mission Control never sees a separate click.
+			cancelTapClick();
+			gesture.dragging = true;
+			gesture.pressedAtLanding = true;
+			postMouse(kCGEventLeftMouseDown, kCGMouseButtonLeft, gesture.clickCount, 0, 0);
+			logVerbose("touched again after a tap: left button down");
+		} else {
+			postTapClick();
+		}
+	}
 }
 
 static void endTouch(double time) {
@@ -866,6 +908,17 @@ static void endTouch(double time) {
 	finishDockSwipe();
 	// As with "Without Drag Lock", a drag outlives a brief lift so the finger can be re-placed; a tap drops it at once.
 	if (gesture.dragging) {
+		// A quick second tap releases the press and completes a double click, as on Apple's trackpad.
+		if (gesture.pressedAtLanding && isTap) {
+			gesture.dragging = false;
+			postMouse(kCGEventLeftMouseUp, kCGMouseButtonLeft, gesture.clickCount, 0, 0);
+			gesture.clickCount++;
+			click(kCGMouseButtonLeft, gesture.clickCount);
+			gesture.lastTapEnd = time;
+			logVerbose("tap: left click (count %d)", gesture.clickCount);
+			return;
+		}
+
 		if (isTap) {
 			releaseDrag();
 		} else {
@@ -890,9 +943,13 @@ static void endTouch(double time) {
 				gesture.clickCount = 1;
 			}
 
-			click(kCGMouseButtonLeft, gesture.clickCount);
 			gesture.lastTapEnd = time;
-			logVerbose("tap: left click (count %d)", gesture.clickCount);
+			if (gesture.tapToDrag) {
+				scheduleTapClick();
+			} else {
+				postTapClick();
+			}
+
 			break;
 		case 2:
 			click(kCGMouseButtonRight, 1);
@@ -927,6 +984,14 @@ static void handleTouch(const Touch *touch, double time) {
 		gesture.maxFingers = touch->count;
 	}
 
+	// A second finger makes this a two-finger gesture, so the press from landing only completes the tap's click.
+	if (gesture.pressedAtLanding && touch->count > 1) {
+		gesture.pressedAtLanding = false;
+		gesture.dragging = false;
+		postMouse(kCGEventLeftMouseUp, kCGMouseButtonLeft, gesture.clickCount, 0, 0);
+		logVerbose("tap: left click (count %d)", gesture.clickCount);
+	}
+
 	bool twoFingers = touch->count == 2 && gesture.maxFingers == 2;
 	if (!twoFingers) {
 		finishScroll(time, true);
@@ -957,13 +1022,6 @@ static void handleTouch(const Touch *touch, double time) {
 
 	// A touch acts only at its peak finger count, so lifting out of a scroll never nudges the pointer and lifting out of a swipe never scrolls.
 	if (touch->count == 1 && gesture.maxFingers == 1) {
-		bool heldPastTap = gesture.travel > TAP_MAX_TRAVEL_MM || time - gesture.touchStart > TAP_MAX_SECONDS;
-		if (gesture.armedForDrag && !gesture.dragging && heldPastTap) {
-			gesture.dragging = true;
-			postMouse(kCGEventLeftMouseDown, kCGMouseButtonLeft, 1, 0, 0);
-			logVerbose("drag start");
-		}
-
 		moveCursor(dx, dy, seconds);
 	} else if (twoFingers) {
 		trackTwoFingers(dx, dy, spread, seconds, time);
@@ -977,6 +1035,7 @@ static void handleTouch(const Touch *touch, double time) {
 }
 
 static void resetGesture(void) {
+	cancelTapClick();
 	releaseDrag();
 	finishScroll(now(), false);
 	stopMomentum("stopped by a reset");
