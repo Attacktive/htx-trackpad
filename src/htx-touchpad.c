@@ -276,6 +276,7 @@ static double loggedTrackingScaling = -1;
 static double now(void) {
 	struct timespec spec;
 	clock_gettime(CLOCK_MONOTONIC, &spec);
+
 	return spec.tv_sec + spec.tv_nsec / 1e9;
 }
 
@@ -433,6 +434,7 @@ static CGPoint clampToDisplays(CGPoint from, CGPoint to) {
 	CGRect bounds = CGDisplayBounds(display);
 	to.x = fmin(fmax(to.x, CGRectGetMinX(bounds)), CGRectGetMaxX(bounds) - 1);
 	to.y = fmin(fmax(to.y, CGRectGetMinY(bounds)), CGRectGetMaxY(bounds) - 1);
+
 	return to;
 }
 
@@ -491,6 +493,7 @@ static double curveGain(const CurvePoint *curve, size_t count, double speed) {
 		if (speed <= curve[i].speed) {
 			CurvePoint low = curve[i - 1];
 			CurvePoint high = curve[i];
+
 			return low.gain + (high.gain - low.gain) * (speed - low.speed) / (high.speed - low.speed);
 		}
 	}
@@ -561,6 +564,7 @@ static void onMomentumTimer(CFRunLoopTimerRef timer, void *info) {
 	double decay = exp(-elapsed / MOMENTUM_TIME_CONSTANT_SECONDS);
 	if (hypot(momentum.velocityX, momentum.velocityY) * decay < MOMENTUM_STOP_SPEED) {
 		stopMomentum("ended");
+
 		return;
 	}
 
@@ -599,10 +603,12 @@ static int32_t takeScrollStep(double *remainder, double points, bool floored) {
 	int32_t step = (int32_t)trunc(*remainder);
 	if (step == 0 && floored) {
 		*remainder = 0;
+
 		return (int32_t)copysign(1.0, points);
 	}
 
 	*remainder -= step;
+
 	return step;
 }
 
@@ -699,9 +705,11 @@ static void trackTwoFingers(double dxMm, double dyMm, double spreadMm, double se
 	switch (gesture.twoFingerGesture) {
 		case TWO_FINGER_SCROLL:
 			scroll(dxMm, dyMm, seconds, time);
+
 			return;
 		case TWO_FINGER_PINCH:
 			pinch(spreadMm);
+
 			return;
 		case TWO_FINGER_UNDECIDED:
 			break;
@@ -814,6 +822,7 @@ static void trackDockSwipe(double dxMm, double dyMm, double seconds) {
 		gesture.swipeVelocity = 0;
 		postDockSwipe(HID_PHASE_BEGAN, 0);
 		logVerbose("dock swipe began: motion %d, progress %.3f", gesture.swipeMotion, gesture.swipeProgress);
+
 		return;
 	}
 
@@ -1061,6 +1070,7 @@ static void endTouch(double time) {
 			click(kCGMouseButtonLeft, gesture.clickCount);
 			gesture.lastTapEnd = time;
 			logVerbose("tap: left click (count %d)", gesture.clickCount);
+
 			return;
 		}
 
@@ -1072,11 +1082,13 @@ static void endTouch(double time) {
 		}
 
 		gesture.lastTapEnd = 0;
+
 		return;
 	}
 
 	if (!isTap) {
 		gesture.lastTapEnd = 0;
+
 		return;
 	}
 
@@ -1152,6 +1164,7 @@ static void handleTouch(const Touch *touch, double time) {
 		gesture.referenceY = touch->y;
 		gesture.referenceSpread = touch->spread;
 		gesture.referenceTime = time;
+
 		return;
 	}
 
@@ -1196,6 +1209,7 @@ static void resetGesture(void) {
 
 static IOReturn setTouchpadMode(IOHIDDeviceRef device) {
 	uint8_t report[] = {REPORT_ID_INPUT_MODE, INPUT_MODE_TOUCHPAD};
+
 	return IOHIDDeviceSetReport(device, kIOHIDReportTypeFeature, REPORT_ID_INPUT_MODE, report, sizeof(report));
 }
 
@@ -1260,6 +1274,7 @@ static bool loadDockSwipeApi(void) {
 	dockSwipeApi.setDoubleValue = dlsym(iokit, "IOHIDEventSetDoubleValue");
 	dockSwipeApi.appendEvent = dlsym(iokit, "IOHIDEventAppendEvent");
 	dockSwipeApi.attachToEvent = dlsym(skylight, "SLEventSetIOHIDEvent");
+
 	return dockSwipeApi.create && dockSwipeApi.setEventFlags && dockSwipeApi.setIntegerValue && dockSwipeApi.setDoubleValue && dockSwipeApi.appendEvent && dockSwipeApi.attachToEvent;
 }
 
@@ -1297,6 +1312,7 @@ static bool findMultitouchDevice(void) {
 	}
 
 	IOObjectRelease(iterator);
+
 	return multitouchRegistryId != 0 && multitouchDeviceId != 0;
 }
 
@@ -1315,6 +1331,7 @@ static bool loadTouchApi(void) {
 	touchApi.appendEvent = dlsym(iokit, "IOHIDEventAppendEvent");
 	touchApi.attachToEvent = dlsym(skylight, "SLEventSetIOHIDEvent");
 	bool loaded = touchApi.createDigitizer && touchApi.createFinger && touchApi.createVendorDefined && touchApi.setSenderID && touchApi.setIntegerValue && touchApi.appendEvent && touchApi.attachToEvent;
+
 	return loaded && findMultitouchDevice();
 }
 
@@ -1370,6 +1387,8 @@ int main(int argc, char **argv) {
 	CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopDefaultMode);
 
 	logLine("started: speed %.2f, verbose: %s, accessibility: %s, input monitoring: %s, dock swipes: %s, touches: %s, HID manager open: 0x%08x", speedFactor, yesNo(verbose), yesNo(accessibilityTrusted), yesNo(inputMonitoringGranted), yesNo(dockSwipesAvailable), yesNo(touchEventsAvailable), openResult);
+
 	CFRunLoopRun();
+
 	return 0;
 }

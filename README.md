@@ -49,8 +49,10 @@ This installs `~/.local/bin/htx-touchpad` and the login agent `~/Library/LaunchA
 
 Then grant two permissions in System Settings → Privacy & Security, adding `~/.local/bin/htx-touchpad` with **+** and **⌘⇧G** (not the copy in `build/`):
 
-- **Input Monitoring**, to read the pad. The helper does not notice this grant while running, so run `make restart` afterwards.
-- **Accessibility**, to move the pointer. The helper restarts itself within about 10 seconds of this grant.
+- **Input Monitoring**, to read the pad.
+	The helper does not notice this grant while running, so run `make restart` afterwards.
+- **Accessibility**, to move the pointer.
+	The helper restarts itself within about 10 seconds of this grant.
 
 ## Rebuilding
 
