@@ -36,6 +36,8 @@ enum {
 	CG_EVENT_FIELD_GESTURE_SUBTYPE = 110,
 	CG_EVENT_FIELD_GESTURE_ZOOM_VALUE = 113,
 	CG_EVENT_FIELD_GESTURE_PHASE = 132,
+	// Undocumented scroll field that AppKit reports as isDirectionInvertedFromDevice, which the built-in trackpad sets under natural scrolling.
+	CG_EVENT_FIELD_SCROLL_DIRECTION_INVERTED = 137,
 };
 
 // From Apple's open-source IOHIDFamily (IOHIDEventTypes.h, IOHIDEventFieldDefs.h); the SDK doesn't ship them.
@@ -539,6 +541,7 @@ static void postScroll(int32_t deltaX, int32_t deltaY, int64_t scrollPhase, int6
 	CGEventSetIntegerValueField(event, kCGScrollWheelEventIsContinuous, 1);
 	CGEventSetIntegerValueField(event, kCGScrollWheelEventScrollPhase, scrollPhase);
 	CGEventSetIntegerValueField(event, kCGScrollWheelEventMomentumPhase, momentumPhase);
+	CGEventSetIntegerValueField(event, CG_EVENT_FIELD_SCROLL_DIRECTION_INVERTED, gesture.naturalScrolling);
 	CGEventPost(kCGHIDEventTap, event);
 	CFRelease(event);
 }
