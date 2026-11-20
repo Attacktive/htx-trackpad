@@ -24,6 +24,7 @@ enum {
 	KEY_CODE_RIGHT_ARROW = 0x7C,
 	KEY_CODE_DOWN_ARROW = 0x7D,
 	KEY_CODE_UP_ARROW = 0x7E,
+	SCROLL_HISTORY_LENGTH = 16,
 	// Undocumented CGEvent type that carries Dock gestures such as swipes between Spaces.
 	CG_EVENT_TYPE_DOCK_SWIPE = 30,
 };
@@ -60,7 +61,12 @@ static const double DOCK_SWIPE_LOCK_TRAVEL_MM = 3.0;
 static const double DOCK_SWIPE_PROGRESS_PER_MM_HORIZONTAL = 1.0 / 50.0;
 static const double DOCK_SWIPE_PROGRESS_PER_MM_VERTICAL = -1.0 / 40.0;
 static const double TRACKING_MULTIPLIER_AT_ZERO = 0.25;
-static const double SCROLL_GAIN = 6.0;
+static const double SCROLL_FLOOR_MIN_COUNTS = 0.75;
+static const double MOMENTUM_EXIT_WINDOW_SECONDS = 0.05;
+static const double MOMENTUM_BOOST = 2.4;
+static const double MOMENTUM_TIME_CONSTANT_SECONDS = 0.224;
+static const double MOMENTUM_STOP_SPEED = 100.0;
+static const double MOMENTUM_FRAME_SECONDS = 1.0 / 120.0;
 static const double MODE_REFRESH_SECONDS = 10.0;
 
 typedef struct {
@@ -86,12 +92,30 @@ static const CurvePoint POINTER_CURVE[] = {
 	{850, 60.8},
 };
 
+// Scroll points per mm of finger travel, by finger speed in mm/s, measured on the same trackpad at the default scrolling speed.
+static const CurvePoint SCROLL_CURVE[] = {
+	{0, 6.0},
+	{65, 6.0},
+	{90, 6.4},
+	{115, 7.0},
+	{150, 7.8},
+	{190, 8.6},
+	{250, 9.8},
+	{300, 11.2},
+};
+
 typedef struct {
 	int count;
 	unsigned idMask;
 	double x;
 	double y;
 } Touch;
+
+typedef struct {
+	double time;
+	int32_t deltaX;
+	int32_t deltaY;
+} ScrollSample;
 
 typedef struct {
 	bool touching;
@@ -115,6 +139,9 @@ typedef struct {
 	int clickCount;
 	double scrollRemainderX;
 	double scrollRemainderY;
+	bool scrollBegan;
+	ScrollSample scrollHistory[SCROLL_HISTORY_LENGTH];
+	int scrollHistoryNext;
 	double swipeX;
 	double swipeY;
 	bool swiped;
@@ -122,8 +149,20 @@ typedef struct {
 	double swipeProgress;
 	double swipeVelocity;
 	bool naturalScrolling;
+	bool momentumScrolling;
 	double trackingMultiplier;
 } Gesture;
+
+// Coasting after a two-finger scroll outlives the touch that started it.
+typedef struct {
+	CFRunLoopTimerRef timer;
+	double start;
+	double velocityX;
+	double velocityY;
+	int32_t postedX;
+	int32_t postedY;
+	bool began;
+} Momentum;
 
 typedef struct {
 	const char *direction;
@@ -144,6 +183,7 @@ typedef struct {
 } DockSwipeApi;
 
 static Gesture gesture;
+static Momentum momentum;
 static DockSwipeApi dockSwipeApi;
 static bool dockSwipesAvailable;
 static CGEventSourceRef eventSource;
@@ -208,6 +248,25 @@ static bool readNaturalScrolling(void) {
 	}
 
 	return natural;
+}
+
+// The trackpad's scrolling-inertia option in Accessibility settings.
+static bool readMomentumScrolling(void) {
+	CFPropertyListRef value = CFPreferencesCopyAppValue(CFSTR("TrackpadMomentumScroll"), CFSTR("com.apple.AppleMultitouchTrackpad"));
+	bool enabled = true;
+	if (value) {
+		if (CFGetTypeID(value) == CFNumberGetTypeID()) {
+			int number = 1;
+			CFNumberGetValue(value, kCFNumberIntType, &number);
+			enabled = number != 0;
+		} else if (CFGetTypeID(value) == CFBooleanGetTypeID()) {
+			enabled = CFBooleanGetValue(value);
+		}
+
+		CFRelease(value);
+	}
+
+	return enabled;
 }
 
 // Maps the Trackpad "Tracking speed" slider (0 to 3) linearly onto a pointer multiplier that is 1 at the slider's 1.0 notch.
@@ -333,21 +392,28 @@ static void pressControlArrow(CGKeyCode keyCode) {
 	postKey(keyCode, false, flags);
 }
 
-static double pointerGain(double speed) {
-	size_t count = sizeof(POINTER_CURVE) / sizeof(POINTER_CURVE[0]);
-	if (speed <= POINTER_CURVE[0].speed) {
-		return POINTER_CURVE[0].gain;
+static double curveGain(const CurvePoint *curve, size_t count, double speed) {
+	if (speed <= curve[0].speed) {
+		return curve[0].gain;
 	}
 
 	for (size_t i = 1; i < count; i++) {
-		if (speed <= POINTER_CURVE[i].speed) {
-			CurvePoint low = POINTER_CURVE[i - 1];
-			CurvePoint high = POINTER_CURVE[i];
+		if (speed <= curve[i].speed) {
+			CurvePoint low = curve[i - 1];
+			CurvePoint high = curve[i];
 			return low.gain + (high.gain - low.gain) * (speed - low.speed) / (high.speed - low.speed);
 		}
 	}
 
-	return POINTER_CURVE[count - 1].gain;
+	return curve[count - 1].gain;
+}
+
+static double pointerGain(double speed) {
+	return curveGain(POINTER_CURVE, sizeof(POINTER_CURVE) / sizeof(POINTER_CURVE[0]), speed);
+}
+
+static double scrollGain(double speed) {
+	return curveGain(SCROLL_CURVE, sizeof(SCROLL_CURVE) / sizeof(SCROLL_CURVE[0]), speed);
 }
 
 static void moveCursor(double dxMm, double dyMm, double seconds) {
@@ -370,30 +436,134 @@ static void moveCursor(double dxMm, double dyMm, double seconds) {
 	}
 }
 
-static void scroll(double dxMm, double dyMm) {
-	double direction = 1.0;
-	if (!gesture.naturalScrolling) {
-		direction = -1.0;
-	}
-
-	gesture.scrollRemainderX += dxMm * SCROLL_GAIN * direction;
-	gesture.scrollRemainderY += dyMm * SCROLL_GAIN * direction;
-	int32_t wheelX = (int32_t)trunc(gesture.scrollRemainderX);
-	int32_t wheelY = (int32_t)trunc(gesture.scrollRemainderY);
-	if (wheelX == 0 && wheelY == 0) {
-		return;
-	}
-
-	gesture.scrollRemainderX -= wheelX;
-	gesture.scrollRemainderY -= wheelY;
-	CGEventRef event = CGEventCreateScrollWheelEvent2(eventSource, kCGScrollEventUnitPixel, 2, wheelY, wheelX, 0);
+// Apple's trackpads tag each scroll with a gesture phase and keep sending momentum-phase events after a lift; apps such as Kitty and JetBrains IDEs coast only on those.
+static void postScroll(int32_t deltaX, int32_t deltaY, int64_t scrollPhase, int64_t momentumPhase) {
+	CGEventRef event = CGEventCreateScrollWheelEvent2(eventSource, kCGScrollEventUnitPixel, 2, deltaY, deltaX, 0);
 	if (!event) {
 		return;
 	}
 
 	CGEventSetIntegerValueField(event, kCGScrollWheelEventIsContinuous, 1);
+	CGEventSetIntegerValueField(event, kCGScrollWheelEventScrollPhase, scrollPhase);
+	CGEventSetIntegerValueField(event, kCGScrollWheelEventMomentumPhase, momentumPhase);
 	CGEventPost(kCGHIDEventTap, event);
 	CFRelease(event);
+}
+
+static void stopMomentum(const char *reason) {
+	if (!momentum.timer) {
+		return;
+	}
+
+	CFRunLoopTimerInvalidate(momentum.timer);
+	CFRelease(momentum.timer);
+	momentum.timer = NULL;
+	if (momentum.began) {
+		postScroll(0, 0, 0, kCGMomentumScrollPhaseEnd);
+	}
+
+	logVerbose("momentum %s after %.2f s: %d, %d pt", reason, now() - momentum.start, momentum.postedX, momentum.postedY);
+}
+
+// Measured on Apple's trackpad: coasting speed decays exponentially from a boosted exit speed, so the distance covered is closed-form.
+static void onMomentumTimer(CFRunLoopTimerRef timer, void *info) {
+	double elapsed = now() - momentum.start;
+	double decay = exp(-elapsed / MOMENTUM_TIME_CONSTANT_SECONDS);
+	if (hypot(momentum.velocityX, momentum.velocityY) * decay < MOMENTUM_STOP_SPEED) {
+		stopMomentum("ended");
+		return;
+	}
+
+	double reach = MOMENTUM_TIME_CONSTANT_SECONDS * (1.0 - decay);
+	int32_t deltaX = (int32_t)trunc(momentum.velocityX * reach) - momentum.postedX;
+	int32_t deltaY = (int32_t)trunc(momentum.velocityY * reach) - momentum.postedY;
+	if (deltaX == 0 && deltaY == 0) {
+		return;
+	}
+
+	momentum.postedX += deltaX;
+	momentum.postedY += deltaY;
+	int64_t phase = kCGMomentumScrollPhaseContinue;
+	if (!momentum.began) {
+		momentum.began = true;
+		phase = kCGMomentumScrollPhaseBegin;
+	}
+
+	postScroll(deltaX, deltaY, 0, phase);
+}
+
+static void startMomentum(double velocityX, double velocityY) {
+	stopMomentum("replaced");
+	if (hypot(velocityX, velocityY) < MOMENTUM_STOP_SPEED) {
+		return;
+	}
+
+	momentum = (Momentum){.start = now(), .velocityX = velocityX, .velocityY = velocityY};
+	momentum.timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + MOMENTUM_FRAME_SECONDS, MOMENTUM_FRAME_SECONDS, 0, 0, onMomentumTimer, NULL);
+	CFRunLoopAddTimer(CFRunLoopGetCurrent(), momentum.timer, kCFRunLoopDefaultMode);
+}
+
+// Apple's trackpad sends at least one point for every frame in which the fingers move along the scroll, which sets the pace of a slow crawl.
+static int32_t takeScrollStep(double *remainder, double points, bool floored) {
+	*remainder += points;
+	int32_t step = (int32_t)trunc(*remainder);
+	if (step == 0 && floored) {
+		*remainder = 0;
+		return (int32_t)copysign(1.0, points);
+	}
+
+	*remainder -= step;
+	return step;
+}
+
+static void scroll(double dxMm, double dyMm, double seconds, double time) {
+	double speed = hypot(dxMm, dyMm) / seconds;
+	gesture.smoothedSpeed = 0.7 * gesture.smoothedSpeed + 0.3 * speed;
+	double scale = scrollGain(gesture.smoothedSpeed);
+	if (!gesture.naturalScrolling) {
+		scale = -scale;
+	}
+
+	bool vertical = fabs(dyMm) >= fabs(dxMm);
+	int32_t wheelX = takeScrollStep(&gesture.scrollRemainderX, dxMm * scale, !vertical && fabs(dxMm) * COUNTS_PER_MM >= SCROLL_FLOOR_MIN_COUNTS);
+	int32_t wheelY = takeScrollStep(&gesture.scrollRemainderY, dyMm * scale, vertical && fabs(dyMm) * COUNTS_PER_MM >= SCROLL_FLOOR_MIN_COUNTS);
+	if (wheelX == 0 && wheelY == 0) {
+		return;
+	}
+
+	int64_t phase = kCGScrollPhaseChanged;
+	if (!gesture.scrollBegan) {
+		gesture.scrollBegan = true;
+		phase = kCGScrollPhaseBegan;
+	}
+
+	postScroll(wheelX, wheelY, phase, kCGMomentumScrollPhaseNone);
+	gesture.scrollHistory[gesture.scrollHistoryNext] = (ScrollSample){time, wheelX, wheelY};
+	gesture.scrollHistoryNext = (gesture.scrollHistoryNext + 1) % SCROLL_HISTORY_LENGTH;
+}
+
+// Momentum starts from the average scroll speed over the last moments before the fingers stopped scrolling, as Apple's does.
+static void finishScroll(double time, bool coast) {
+	if (!gesture.scrollBegan) {
+		return;
+	}
+
+	gesture.scrollBegan = false;
+	postScroll(0, 0, kCGScrollPhaseEnded, kCGMomentumScrollPhaseNone);
+	double exitX = 0;
+	double exitY = 0;
+	for (int i = 0; i < SCROLL_HISTORY_LENGTH; i++) {
+		ScrollSample sample = gesture.scrollHistory[i];
+		if (time - sample.time < MOMENTUM_EXIT_WINDOW_SECONDS) {
+			exitX += sample.deltaX / MOMENTUM_EXIT_WINDOW_SECONDS;
+			exitY += sample.deltaY / MOMENTUM_EXIT_WINDOW_SECONDS;
+		}
+	}
+
+	logVerbose("scroll end: exit velocity %.0f, %.0f pt/s", exitX, exitY);
+	if (coast && gesture.momentumScrolling) {
+		startMomentum(exitX * MOMENTUM_BOOST, exitY * MOMENTUM_BOOST);
+	}
 }
 
 // Pad Y grows toward the user, and Spaces follow the fingers as on Apple's trackpads: swiping left brings in the Space on the right.
@@ -551,6 +721,7 @@ static void scheduleDragRelease(void) {
 }
 
 static void beginTouch(double time) {
+	stopMomentum("stopped by a touch");
 	if (gesture.dragging) {
 		cancelDragRelease();
 		logVerbose("drag resumed");
@@ -567,12 +738,15 @@ static void beginTouch(double time) {
 	gesture.referenceValid = false;
 	gesture.scrollRemainderX = 0;
 	gesture.scrollRemainderY = 0;
+	memset(gesture.scrollHistory, 0, sizeof(gesture.scrollHistory));
 	gesture.swipeX = 0;
 	gesture.swipeY = 0;
 	gesture.swiped = false;
 	gesture.armedForDrag = time - gesture.lastTapEnd <= TAP_DRAG_WINDOW_SECONDS;
 	CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
+	CFPreferencesAppSynchronize(CFSTR("com.apple.AppleMultitouchTrackpad"));
 	gesture.naturalScrolling = readNaturalScrolling();
+	gesture.momentumScrolling = readMomentumScrolling();
 	gesture.trackingMultiplier = readTrackingMultiplier();
 	syncCursor();
 }
@@ -585,6 +759,7 @@ static void endTouch(double time) {
 		logVerbose("pointer: finger %.1f mm, cursor %.0f pt, average %.1f pt/mm, peak speed %.0f mm/s", gesture.pointerFingerTravel, gesture.pointerCursorTravel, gesture.pointerCursorTravel / gesture.pointerFingerTravel, gesture.peakSpeed);
 	}
 
+	finishScroll(time, true);
 	finishDockSwipe();
 	// As with "Without Drag Lock", a drag outlives a brief lift so the finger can be re-placed; a tap drops it at once.
 	if (gesture.dragging) {
@@ -649,6 +824,11 @@ static void handleTouch(const Touch *touch, double time) {
 		gesture.maxFingers = touch->count;
 	}
 
+	bool scrolling = touch->count == 2 && gesture.maxFingers == 2;
+	if (!scrolling) {
+		finishScroll(time, true);
+	}
+
 	// Re-anchor whenever the set of fingers changes, so a finger landing or lifting never reads as movement.
 	if (!gesture.referenceValid || touch->idMask != gesture.referenceMask) {
 		gesture.referenceValid = true;
@@ -677,8 +857,8 @@ static void handleTouch(const Touch *touch, double time) {
 		}
 
 		moveCursor(dx, dy, seconds);
-	} else if (touch->count == 2 && gesture.maxFingers == 2) {
-		scroll(dx, dy);
+	} else if (scrolling) {
+		scroll(dx, dy, seconds, time);
 	} else if (touch->count == 3 && gesture.maxFingers == 3) {
 		if (dockSwipesAvailable) {
 			trackDockSwipe(dx, dy, seconds);
@@ -690,6 +870,8 @@ static void handleTouch(const Touch *touch, double time) {
 
 static void resetGesture(void) {
 	releaseDrag();
+	finishScroll(now(), false);
+	stopMomentum("stopped by a reset");
 	finishDockSwipe();
 	gesture.touching = false;
 	gesture.referenceValid = false;

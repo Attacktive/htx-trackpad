@@ -23,7 +23,7 @@ This helper switches the pad to Precision Touchpad mode, reads the finger report
 | Tap, then touch again and slide | Drag; after a lift the item stays held for a second, so touch again to keep dragging or tap to drop it |
 | Two-finger tap | Right click |
 | Three-finger tap | Middle click |
-| Two-finger slide | Scroll, following the system's natural-scrolling setting |
+| Two-finger slide | Scroll, following the system's natural-scrolling setting; a flick keeps coasting after the lift until a touch stops it |
 | Three-finger swipe up | Mission Control |
 | Three-finger swipe down | App Exposé |
 | Three-finger swipe left or right | Move to the Space on the right or left |
@@ -42,7 +42,7 @@ That fallback needs the shortcuts enabled in System Settings → Keyboard → Ke
 make install            # or: make install SPEED=1.2 VERBOSE=1
 ```
 
-`VERBOSE=1` logs every touch: taps, drags, and per-movement pointer statistics.
+`VERBOSE=1` logs every touch: taps, drags, scroll and momentum endings, and per-movement pointer statistics.
 
 This installs `~/.local/bin/htx-touchpad` and the login agent `~/Library/LaunchAgents/xyz.attacktive.htx-touchpad.plist`, then starts it.
 
@@ -69,6 +69,17 @@ The pointer also follows the Trackpad "Tracking speed" slider in System Settings
 The slider's 0–3 range maps linearly onto a multiplier from 0.25 to 2.5, which is 1 at the 1.0 notch, applied to the whole curve along with `SPEED`.
 At 1.0 the curve matches Apple's; at other notches it is an approximation, since Apple's curve also changes shape.
 The add-on pad and the built-in trackpad share that one slider.
+
+## Scrolling
+
+Scrolling copies Apple's trackpad too, measured on the same MacBook at the default scrolling speed.
+The curve gives about 6 points per mm of finger travel up to 65 mm/s, rising to about 11 at 300 mm/s and beyond.
+As on Apple's trackpad, every report in which the fingers move along the scroll sends at least one point, so a slow crawl scrolls faster than the curve alone would.
+Neither `SPEED` nor the Tracking speed slider affects scrolling.
+
+Scroll events carry the same gesture phases as Apple's, and after a lift the helper sends the momentum events itself, since apps such as Kitty and JetBrains IDEs coast only on those.
+Momentum starts at 2.4 times the scroll speed over the last 50 ms and decays exponentially with a time constant of 0.224 s, both measured on the built-in trackpad.
+It follows the trackpad's scrolling-inertia option in Accessibility settings, read at the start of every touch, and any touch stops it.
 
 ## Other targets
 
