@@ -24,6 +24,7 @@ This helper switches the pad to Precision Touchpad mode, reads the finger report
 | Two-finger tap | Right click |
 | Three-finger tap | Middle click |
 | Two-finger slide | Scroll, following the system's natural-scrolling setting; a flick keeps coasting after the lift until a touch stops it |
+| Two-finger pinch or spread | Zoom out or in, unless pinch to zoom is off in Trackpad settings |
 | Three-finger swipe up | Mission Control |
 | Three-finger swipe down | App Exposé |
 | Three-finger swipe left or right | Move to the Space on the right or left |
@@ -80,6 +81,15 @@ Neither `SPEED` nor the Tracking speed slider affects scrolling.
 Scroll events carry the same gesture phases as Apple's, and after a lift the helper sends the momentum events itself, since apps such as Kitty and JetBrains IDEs coast only on those.
 Momentum starts at 2.4 times the scroll speed over the last 50 ms and decays exponentially with a time constant of 0.224 s, both measured on the built-in trackpad.
 It follows the trackpad's scrolling-inertia option in Accessibility settings, read at the start of every touch, and any touch stops it.
+
+## Pinch to zoom
+
+A two-finger touch waits for a little movement before it commits, as on Apple's trackpad.
+It scrolls once the fingers' midpoint has traveled 1 mm, and farther than the distance between the fingers has changed.
+It pinches once that distance has changed by 2 mm, and at least as much as the midpoint has traveled, even with one finger held still.
+
+A pinch sends the same magnify events as Apple's trackpad, at 0.0315 per mm of change in the distance between the fingers, the steady rate measured on the built-in trackpad at every speed.
+They are built with public CoreGraphics calls and undocumented field numbers, so they need no private functions.
 
 ## Other targets
 

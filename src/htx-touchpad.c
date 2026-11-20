@@ -27,10 +27,16 @@ enum {
 	SCROLL_HISTORY_LENGTH = 16,
 	// Undocumented CGEvent type that carries Dock gestures such as swipes between Spaces.
 	CG_EVENT_TYPE_DOCK_SWIPE = 30,
+	// Undocumented CGEvent type and fields that carry trackpad gestures such as pinches; AppKit reports field 113 as the magnification.
+	CG_EVENT_TYPE_GESTURE = 29,
+	CG_EVENT_FIELD_GESTURE_SUBTYPE = 110,
+	CG_EVENT_FIELD_GESTURE_ZOOM_VALUE = 113,
+	CG_EVENT_FIELD_GESTURE_PHASE = 132,
 };
 
 // From Apple's open-source IOHIDFamily (IOHIDEventTypes.h, IOHIDEventFieldDefs.h); the SDK doesn't ship them.
 enum {
+	HID_EVENT_TYPE_ZOOM = 8,
 	HID_EVENT_TYPE_VELOCITY = 9,
 	HID_EVENT_TYPE_DOCK_SWIPE = 23,
 	HID_FIELD_VELOCITY_X = HID_EVENT_TYPE_VELOCITY << 16,
@@ -61,7 +67,10 @@ static const double DOCK_SWIPE_LOCK_TRAVEL_MM = 3.0;
 static const double DOCK_SWIPE_PROGRESS_PER_MM_HORIZONTAL = 1.0 / 50.0;
 static const double DOCK_SWIPE_PROGRESS_PER_MM_VERTICAL = -1.0 / 40.0;
 static const double TRACKING_MULTIPLIER_AT_ZERO = 0.25;
+static const double SCROLL_START_TRAVEL_MM = 1.0;
 static const double SCROLL_FLOOR_MIN_COUNTS = 0.75;
+static const double PINCH_START_SPREAD_MM = 2.0;
+static const double PINCH_MAGNIFICATION_PER_MM = 0.0315;
 static const double MOMENTUM_EXIT_WINDOW_SECONDS = 0.05;
 static const double MOMENTUM_BOOST = 2.4;
 static const double MOMENTUM_TIME_CONSTANT_SECONDS = 0.224;
@@ -109,7 +118,14 @@ typedef struct {
 	unsigned idMask;
 	double x;
 	double y;
+	double spread;
 } Touch;
+
+typedef enum {
+	TWO_FINGER_UNDECIDED,
+	TWO_FINGER_SCROLL,
+	TWO_FINGER_PINCH,
+} TwoFingerGesture;
 
 typedef struct {
 	double time;
@@ -132,6 +148,7 @@ typedef struct {
 	unsigned referenceMask;
 	double referenceX;
 	double referenceY;
+	double referenceSpread;
 	double referenceTime;
 	double cursorX;
 	double cursorY;
@@ -139,6 +156,11 @@ typedef struct {
 	int clickCount;
 	double scrollRemainderX;
 	double scrollRemainderY;
+	TwoFingerGesture twoFingerGesture;
+	double twoFingerX;
+	double twoFingerY;
+	double twoFingerSpread;
+	double pinchMagnification;
 	bool scrollBegan;
 	ScrollSample scrollHistory[SCROLL_HISTORY_LENGTH];
 	int scrollHistoryNext;
@@ -150,6 +172,7 @@ typedef struct {
 	double swipeVelocity;
 	bool naturalScrolling;
 	bool momentumScrolling;
+	bool pinchZooming;
 	double trackingMultiplier;
 } Gesture;
 
@@ -250,9 +273,9 @@ static bool readNaturalScrolling(void) {
 	return natural;
 }
 
-// The trackpad's scrolling-inertia option in Accessibility settings.
-static bool readMomentumScrolling(void) {
-	CFPropertyListRef value = CFPreferencesCopyAppValue(CFSTR("TrackpadMomentumScroll"), CFSTR("com.apple.AppleMultitouchTrackpad"));
+// On/off trackpad options from System Settings, such as scrolling inertia (TrackpadMomentumScroll) and pinch to zoom (TrackpadPinch).
+static bool readTrackpadOption(CFStringRef key) {
+	CFPropertyListRef value = CFPreferencesCopyAppValue(key, CFSTR("com.apple.AppleMultitouchTrackpad"));
 	bool enabled = true;
 	if (value) {
 		if (CFGetTypeID(value) == CFNumberGetTypeID()) {
@@ -297,6 +320,8 @@ static Touch parseTouch(const uint8_t *report) {
 		slots = MAX_CONTACTS;
 	}
 
+	double xs[MAX_CONTACTS];
+	double ys[MAX_CONTACTS];
 	for (int i = 0; i < slots; i++) {
 		const uint8_t *contact = report + 1 + i * CONTACT_LENGTH;
 		bool confident = contact[0] & 0x01;
@@ -305,15 +330,21 @@ static Touch parseTouch(const uint8_t *report) {
 			continue;
 		}
 
-		touch.count++;
+		xs[touch.count] = (contact[1] | contact[2] << 8) / COUNTS_PER_MM;
+		ys[touch.count] = (contact[3] | contact[4] << 8) / COUNTS_PER_MM;
+		touch.x += xs[touch.count];
+		touch.y += ys[touch.count];
 		touch.idMask |= 1u << ((contact[0] >> 2) & 0x07);
-		touch.x += (contact[1] | contact[2] << 8) / COUNTS_PER_MM;
-		touch.y += (contact[3] | contact[4] << 8) / COUNTS_PER_MM;
+		touch.count++;
 	}
 
 	if (touch.count > 0) {
 		touch.x /= touch.count;
 		touch.y /= touch.count;
+	}
+
+	if (touch.count == 2) {
+		touch.spread = hypot(xs[0] - xs[1], ys[0] - ys[1]);
 	}
 
 	return touch;
@@ -566,6 +597,72 @@ static void finishScroll(double time, bool coast) {
 	}
 }
 
+static void postPinch(uint32_t phase, double magnification) {
+	CGEventRef event = CGEventCreate(NULL);
+	if (!event) {
+		return;
+	}
+
+	CGEventSetType(event, (CGEventType)CG_EVENT_TYPE_GESTURE);
+	CGEventSetIntegerValueField(event, CG_EVENT_FIELD_GESTURE_SUBTYPE, HID_EVENT_TYPE_ZOOM);
+	CGEventSetIntegerValueField(event, CG_EVENT_FIELD_GESTURE_PHASE, phase);
+	CGEventSetDoubleValueField(event, CG_EVENT_FIELD_GESTURE_ZOOM_VALUE, magnification);
+	CGEventPost(kCGHIDEventTap, event);
+	CFRelease(event);
+}
+
+// As measured on Apple's trackpad, magnification follows the change in distance between the fingers linearly, at any speed.
+static void pinch(double spreadMm) {
+	if (spreadMm == 0) {
+		return;
+	}
+
+	double magnification = spreadMm * PINCH_MAGNIFICATION_PER_MM;
+	gesture.pinchMagnification += magnification;
+	postPinch(HID_PHASE_CHANGED, magnification);
+}
+
+static void finishPinch(void) {
+	if (gesture.twoFingerGesture != TWO_FINGER_PINCH) {
+		return;
+	}
+
+	gesture.twoFingerGesture = TWO_FINGER_UNDECIDED;
+	gesture.twoFingerX = 0;
+	gesture.twoFingerY = 0;
+	gesture.twoFingerSpread = 0;
+	postPinch(HID_PHASE_ENDED, 0);
+	logVerbose("pinch end: magnification %+.3f", gesture.pinchMagnification);
+}
+
+// Like Apple's trackpad, a two-finger touch waits for a little movement before committing: fingers sliding together scroll, while fingers spreading or closing pinch, even with one finger still, which moves their midpoint half as far.
+static void trackTwoFingers(double dxMm, double dyMm, double spreadMm, double seconds, double time) {
+	switch (gesture.twoFingerGesture) {
+		case TWO_FINGER_SCROLL:
+			scroll(dxMm, dyMm, seconds, time);
+			return;
+		case TWO_FINGER_PINCH:
+			pinch(spreadMm);
+			return;
+		case TWO_FINGER_UNDECIDED:
+			break;
+	}
+
+	gesture.twoFingerX += dxMm;
+	gesture.twoFingerY += dyMm;
+	gesture.twoFingerSpread += spreadMm;
+	double travel = hypot(gesture.twoFingerX, gesture.twoFingerY);
+	double spread = fabs(gesture.twoFingerSpread);
+	if (gesture.pinchZooming && spread >= PINCH_START_SPREAD_MM && spread >= travel) {
+		gesture.twoFingerGesture = TWO_FINGER_PINCH;
+		gesture.pinchMagnification = 0;
+		postPinch(HID_PHASE_BEGAN, 0);
+		logVerbose("pinch began: spread %+.1f mm, travel %.1f mm", gesture.twoFingerSpread, travel);
+	} else if (travel >= SCROLL_START_TRAVEL_MM && (travel > spread || !gesture.pinchZooming)) {
+		gesture.twoFingerGesture = TWO_FINGER_SCROLL;
+	}
+}
+
 // Pad Y grows toward the user, and Spaces follow the fingers as on Apple's trackpads: swiping left brings in the Space on the right.
 static Swipe classifySwipe(double dxMm, double dyMm) {
 	if (fabs(dxMm) > fabs(dyMm)) {
@@ -739,6 +836,10 @@ static void beginTouch(double time) {
 	gesture.scrollRemainderX = 0;
 	gesture.scrollRemainderY = 0;
 	memset(gesture.scrollHistory, 0, sizeof(gesture.scrollHistory));
+	gesture.twoFingerGesture = TWO_FINGER_UNDECIDED;
+	gesture.twoFingerX = 0;
+	gesture.twoFingerY = 0;
+	gesture.twoFingerSpread = 0;
 	gesture.swipeX = 0;
 	gesture.swipeY = 0;
 	gesture.swiped = false;
@@ -746,7 +847,8 @@ static void beginTouch(double time) {
 	CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
 	CFPreferencesAppSynchronize(CFSTR("com.apple.AppleMultitouchTrackpad"));
 	gesture.naturalScrolling = readNaturalScrolling();
-	gesture.momentumScrolling = readMomentumScrolling();
+	gesture.momentumScrolling = readTrackpadOption(CFSTR("TrackpadMomentumScroll"));
+	gesture.pinchZooming = readTrackpadOption(CFSTR("TrackpadPinch"));
 	gesture.trackingMultiplier = readTrackingMultiplier();
 	syncCursor();
 }
@@ -760,6 +862,7 @@ static void endTouch(double time) {
 	}
 
 	finishScroll(time, true);
+	finishPinch();
 	finishDockSwipe();
 	// As with "Without Drag Lock", a drag outlives a brief lift so the finger can be re-placed; a tap drops it at once.
 	if (gesture.dragging) {
@@ -824,9 +927,10 @@ static void handleTouch(const Touch *touch, double time) {
 		gesture.maxFingers = touch->count;
 	}
 
-	bool scrolling = touch->count == 2 && gesture.maxFingers == 2;
-	if (!scrolling) {
+	bool twoFingers = touch->count == 2 && gesture.maxFingers == 2;
+	if (!twoFingers) {
 		finishScroll(time, true);
+		finishPinch();
 	}
 
 	// Re-anchor whenever the set of fingers changes, so a finger landing or lifting never reads as movement.
@@ -835,17 +939,21 @@ static void handleTouch(const Touch *touch, double time) {
 		gesture.referenceMask = touch->idMask;
 		gesture.referenceX = touch->x;
 		gesture.referenceY = touch->y;
+		gesture.referenceSpread = touch->spread;
 		gesture.referenceTime = time;
 		return;
 	}
 
 	double dx = touch->x - gesture.referenceX;
 	double dy = touch->y - gesture.referenceY;
+	double spread = touch->spread - gesture.referenceSpread;
 	double seconds = fmax(time - gesture.referenceTime, 0.001);
 	gesture.referenceX = touch->x;
 	gesture.referenceY = touch->y;
+	gesture.referenceSpread = touch->spread;
 	gesture.referenceTime = time;
-	gesture.travel += hypot(dx, dy);
+	// A quick pinch barely moves the fingers' midpoint, so the spread counts as travel too and keeps it from reading as a tap.
+	gesture.travel += hypot(dx, dy) + fabs(spread);
 
 	// A touch acts only at its peak finger count, so lifting out of a scroll never nudges the pointer and lifting out of a swipe never scrolls.
 	if (touch->count == 1 && gesture.maxFingers == 1) {
@@ -857,8 +965,8 @@ static void handleTouch(const Touch *touch, double time) {
 		}
 
 		moveCursor(dx, dy, seconds);
-	} else if (scrolling) {
-		scroll(dx, dy, seconds, time);
+	} else if (twoFingers) {
+		trackTwoFingers(dx, dy, spread, seconds, time);
 	} else if (touch->count == 3 && gesture.maxFingers == 3) {
 		if (dockSwipesAvailable) {
 			trackDockSwipe(dx, dy, seconds);
@@ -872,6 +980,7 @@ static void resetGesture(void) {
 	releaseDrag();
 	finishScroll(now(), false);
 	stopMomentum("stopped by a reset");
+	finishPinch();
 	finishDockSwipe();
 	gesture.touching = false;
 	gesture.referenceValid = false;
