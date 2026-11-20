@@ -101,6 +101,13 @@ It pinches once that distance has changed by 2 mm, and at least as much as the m
 A pinch sends the same magnify events as Apple's trackpad, at 0.0315 per mm of change in the distance between the fingers, the steady rate measured on the built-in trackpad at every speed.
 They are built with public CoreGraphics calls and undocumented field numbers, so they need no private functions.
 
+## Touches
+
+Apple's trackpads also send every finger as a touch, and some apps act on those rather than on gestures alone.
+Chrome, for one, swipes between pages after 8% of the trackpad's width when it has touches, but without them it counted so little of a two-finger swipe that going back took a long, fast swipe.
+The helper sends the pad's fingers as touches too, built with private IOKit and SkyLight functions.
+AppKit accepts trackpad touches only from a multitouch device it knows, so they are filed under the Mac's built-in trackpad, or a Magic Trackpad when there is no built-in one; with neither, the helper sends no touches.
+
 ## Other targets
 
 - `make restart` restarts the helper.

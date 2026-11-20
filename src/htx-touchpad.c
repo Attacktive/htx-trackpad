@@ -1,7 +1,9 @@
 #include <ApplicationServices/ApplicationServices.h>
+#include <IOKit/IOKitLib.h>
 #include <IOKit/hid/IOHIDManager.h>
 #include <IOKit/hidsystem/IOHIDLib.h>
 #include <dlfcn.h>
+#include <mach/mach_time.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -20,6 +22,8 @@ enum {
 	MAX_CONTACTS = 5,
 	CONTACT_LENGTH = 5,
 	CONTACT_COUNT_OFFSET = 28,
+	// Keeps the pad's touch identities clear of the built-in trackpad's own, which they share a device with.
+	TOUCH_INDEX_BASE = 16,
 	KEY_CODE_LEFT_ARROW = 0x7B,
 	KEY_CODE_RIGHT_ARROW = 0x7C,
 	KEY_CODE_DOWN_ARROW = 0x7D,
@@ -36,8 +40,10 @@ enum {
 
 // From Apple's open-source IOHIDFamily (IOHIDEventTypes.h, IOHIDEventFieldDefs.h); the SDK doesn't ship them.
 enum {
+	HID_EVENT_TYPE_VENDOR_DEFINED = 1,
 	HID_EVENT_TYPE_ZOOM = 8,
 	HID_EVENT_TYPE_VELOCITY = 9,
+	HID_EVENT_TYPE_DIGITIZER = 11,
 	HID_EVENT_TYPE_DOCK_SWIPE = 23,
 	HID_FIELD_VELOCITY_X = HID_EVENT_TYPE_VELOCITY << 16,
 	HID_FIELD_VELOCITY_Y = HID_EVENT_TYPE_VELOCITY << 16 | 1,
@@ -52,10 +58,31 @@ enum {
 	HID_PHASE_ENDED = 1 << 2,
 	HID_PHASE_CANCELLED = 1 << 3,
 	HID_EVENT_PHASE_SHIFT = 24,
+	HID_DIGITIZER_TRANSDUCER_HAND = 3,
+	HID_DIGITIZER_EVENT_RANGE = 1 << 0,
+	HID_DIGITIZER_EVENT_TOUCH = 1 << 1,
+	HID_DIGITIZER_EVENT_POSITION = 1 << 2,
+	HID_DIGITIZER_EVENT_IDENTITY = 1 << 5,
+	HID_DIGITIZER_EVENT_ATTRIBUTE = 1 << 6,
 };
 
-// Logical range 0-1599 over a physical width of 4.61 in, per the report descriptor; Y has the same density.
-static const double COUNTS_PER_MM = 1599.0 / 117.1;
+// What AppKit needs to read a digitizer event as trackpad touches, found by disassembling AppKit and MultitouchSupport (_mthid_isPathCollection).
+enum {
+	// The hand event must be flagged as a collection of paths.
+	HID_FIELD_DIGITIZER_COLLECTION = HID_EVENT_TYPE_DIGITIZER << 16 | 22,
+	// A vendor-defined child with this usage and version carries the multitouch device ID in its first 8 bytes.
+	MULTITOUCH_PATH_USAGE_PAGE = 0xFF00,
+	MULTITOUCH_PATH_USAGE = 0x1777,
+	MULTITOUCH_PATH_VERSION = 1,
+	MULTITOUCH_PATH_DATA_LENGTH = 40,
+	// AppKit looks the touches' device up by the IORegistry ID in this CGEvent field.
+	CG_EVENT_FIELD_DEVICE_REGISTRY_ID = 87,
+};
+
+// Logical ranges 0-1599 and 0-1199 over a physical width of 4.61 in, per the report descriptor; Y has the same density.
+static const double LOGICAL_MAX_X = 1599.0;
+static const double LOGICAL_MAX_Y = 1199.0;
+static const double COUNTS_PER_MM = LOGICAL_MAX_X / 117.1;
 
 static const double TAP_MAX_SECONDS = 0.25;
 static const double TAP_MAX_TRAVEL_MM = 2.0;
@@ -114,12 +141,20 @@ static const CurvePoint SCROLL_CURVE[] = {
 	{300, 11.2},
 };
 
+// One finger, with its position normalized to the pad's surface from the top left.
+typedef struct {
+	int contactId;
+	double x;
+	double y;
+} Contact;
+
 typedef struct {
 	int count;
 	unsigned idMask;
 	double x;
 	double y;
 	double spread;
+	Contact contacts[MAX_CONTACTS];
 } Touch;
 
 typedef enum {
@@ -207,10 +242,27 @@ typedef struct {
 	void (*attachToEvent)(CGEventRef event, IOHIDEventRef hidEvent);
 } DockSwipeApi;
 
+// Private IOKit and SkyLight functions that build the touch events Apple's trackpads send for every finger.
+typedef struct {
+	IOHIDEventRef (*createDigitizer)(CFAllocatorRef allocator, uint64_t timestamp, uint32_t transducerType, uint32_t index, uint32_t identity, uint32_t eventMask, uint32_t buttonMask, double x, double y, double z, double tipPressure, double barrelPressure, Boolean range, Boolean touch, uint32_t options);
+	IOHIDEventRef (*createFinger)(CFAllocatorRef allocator, uint64_t timestamp, uint32_t index, uint32_t identity, uint32_t eventMask, double x, double y, double z, double tipPressure, double twist, Boolean range, Boolean touch, uint32_t options);
+	IOHIDEventRef (*createVendorDefined)(CFAllocatorRef allocator, uint64_t timestamp, uint32_t usagePage, uint32_t usage, uint32_t version, const uint8_t *data, CFIndex length, uint32_t options);
+	void (*setSenderID)(IOHIDEventRef event, uint64_t senderID);
+	void (*setIntegerValue)(IOHIDEventRef event, uint32_t field, CFIndex value);
+	void (*appendEvent)(IOHIDEventRef parent, IOHIDEventRef child, uint32_t options);
+	void (*attachToEvent)(CGEventRef event, IOHIDEventRef hidEvent);
+} TouchApi;
+
 static Gesture gesture;
 static Momentum momentum;
 static DockSwipeApi dockSwipeApi;
 static bool dockSwipesAvailable;
+static TouchApi touchApi;
+static bool touchEventsAvailable;
+static uint64_t multitouchRegistryId;
+static uint64_t multitouchDeviceId;
+static Contact postedContacts[MAX_CONTACTS];
+static int postedContactCount;
 static CGEventSourceRef eventSource;
 static CFRunLoopTimerRef dragReleaseTimer;
 static CFRunLoopTimerRef tapClickTimer;
@@ -333,11 +385,15 @@ static Touch parseTouch(const uint8_t *report) {
 			continue;
 		}
 
-		xs[touch.count] = (contact[1] | contact[2] << 8) / COUNTS_PER_MM;
-		ys[touch.count] = (contact[3] | contact[4] << 8) / COUNTS_PER_MM;
+		int contactId = (contact[0] >> 2) & 0x07;
+		int rawX = contact[1] | contact[2] << 8;
+		int rawY = contact[3] | contact[4] << 8;
+		xs[touch.count] = rawX / COUNTS_PER_MM;
+		ys[touch.count] = rawY / COUNTS_PER_MM;
 		touch.x += xs[touch.count];
 		touch.y += ys[touch.count];
-		touch.idMask |= 1u << ((contact[0] >> 2) & 0x07);
+		touch.contacts[touch.count] = (Contact){contactId, rawX / LOGICAL_MAX_X, rawY / LOGICAL_MAX_Y};
+		touch.idMask |= 1u << contactId;
 		touch.count++;
 	}
 
@@ -789,6 +845,95 @@ static void finishDockSwipe(void) {
 	gesture.swipeMotion = 0;
 }
 
+static const Contact *findContact(const Contact *contacts, int count, int contactId) {
+	for (int i = 0; i < count; i++) {
+		if (contacts[i].contactId == contactId) {
+			return &contacts[i];
+		}
+	}
+
+	return NULL;
+}
+
+// Apple's trackpads also send every finger as a touch, and some apps act on those rather than on gestures alone; Chrome's two-finger swipe between pages is one.
+static void postTouches(const Touch *touch) {
+	if (!touchEventsAvailable || (touch->count == 0 && postedContactCount == 0)) {
+		return;
+	}
+
+	uint64_t timestamp = mach_absolute_time();
+	IOHIDEventRef fingers[MAX_CONTACTS * 2];
+	int fingerCount = 0;
+	uint32_t handMask = 0;
+	double centroidX = 0;
+	double centroidY = 0;
+	for (int i = 0; i < touch->count; i++) {
+		const Contact *contact = &touch->contacts[i];
+		const Contact *previous = findContact(postedContacts, postedContactCount, contact->contactId);
+		uint32_t mask = HID_DIGITIZER_EVENT_ATTRIBUTE;
+		if (!previous) {
+			mask |= HID_DIGITIZER_EVENT_RANGE | HID_DIGITIZER_EVENT_TOUCH | HID_DIGITIZER_EVENT_IDENTITY;
+		} else if (previous->x != contact->x || previous->y != contact->y) {
+			mask = HID_DIGITIZER_EVENT_POSITION;
+		}
+
+		fingers[fingerCount++] = touchApi.createFinger(kCFAllocatorDefault, timestamp, TOUCH_INDEX_BASE + contact->contactId, 2 + i, mask, contact->x, contact->y, 0, 0, 0, true, true, 0);
+		handMask |= mask;
+		centroidX += contact->x / touch->count;
+		centroidY += contact->y / touch->count;
+	}
+
+	// A lifted finger ends its touch only while still in range, as on Apple's trackpads.
+	for (int i = 0; i < postedContactCount; i++) {
+		const Contact *contact = &postedContacts[i];
+		if (!findContact(touch->contacts, touch->count, contact->contactId)) {
+			fingers[fingerCount++] = touchApi.createFinger(kCFAllocatorDefault, timestamp, TOUCH_INDEX_BASE + contact->contactId, 0, HID_DIGITIZER_EVENT_TOUCH, contact->x, contact->y, 0, 0, 0, true, false, 0);
+			handMask |= HID_DIGITIZER_EVENT_TOUCH;
+		}
+	}
+
+	memcpy(postedContacts, touch->contacts, sizeof(Contact) * touch->count);
+	postedContactCount = touch->count;
+	IOHIDEventRef hand = touchApi.createDigitizer(kCFAllocatorDefault, timestamp, HID_DIGITIZER_TRANSDUCER_HAND, 0, 1, handMask, 0, centroidX, centroidY, 0, 0, 0, true, touch->count > 0, 0);
+	uint8_t path[MULTITOUCH_PATH_DATA_LENGTH] = {0};
+	memcpy(path, &multitouchDeviceId, sizeof(multitouchDeviceId));
+	IOHIDEventRef pathMarker = touchApi.createVendorDefined(kCFAllocatorDefault, timestamp, MULTITOUCH_PATH_USAGE_PAGE, MULTITOUCH_PATH_USAGE, MULTITOUCH_PATH_VERSION, path, sizeof(path), 0);
+	CGEventRef event = CGEventCreate(NULL);
+	if (hand && pathMarker && event) {
+		touchApi.setIntegerValue(hand, HID_FIELD_DIGITIZER_COLLECTION, 1);
+		touchApi.setSenderID(hand, multitouchRegistryId);
+		for (int i = 0; i < fingerCount; i++) {
+			if (fingers[i]) {
+				touchApi.appendEvent(hand, fingers[i], 0);
+			}
+		}
+
+		touchApi.appendEvent(hand, pathMarker, 0);
+		CGEventSetType(event, (CGEventType)CG_EVENT_TYPE_GESTURE);
+		CGEventSetIntegerValueField(event, CG_EVENT_FIELD_DEVICE_REGISTRY_ID, (int64_t)multitouchRegistryId);
+		touchApi.attachToEvent(event, hand);
+		CGEventPost(kCGHIDEventTap, event);
+	}
+
+	for (int i = 0; i < fingerCount; i++) {
+		if (fingers[i]) {
+			CFRelease(fingers[i]);
+		}
+	}
+
+	if (hand) {
+		CFRelease(hand);
+	}
+
+	if (pathMarker) {
+		CFRelease(pathMarker);
+	}
+
+	if (event) {
+		CFRelease(event);
+	}
+}
+
 static void cancelDragRelease(void) {
 	if (!dragReleaseTimer) {
 		return;
@@ -968,6 +1113,7 @@ static void endTouch(double time) {
 }
 
 static void handleTouch(const Touch *touch, double time) {
+	postTouches(touch);
 	if (touch->count == 0) {
 		if (gesture.touching) {
 			endTouch(time);
@@ -1035,6 +1181,8 @@ static void handleTouch(const Touch *touch, double time) {
 }
 
 static void resetGesture(void) {
+	Touch lifted = {0};
+	postTouches(&lifted);
 	cancelTapClick();
 	releaseDrag();
 	finishScroll(now(), false);
@@ -1115,6 +1263,61 @@ static bool loadDockSwipeApi(void) {
 	return dockSwipeApi.create && dockSwipeApi.setEventFlags && dockSwipeApi.setIntegerValue && dockSwipeApi.setDoubleValue && dockSwipeApi.appendEvent && dockSwipeApi.attachToEvent;
 }
 
+// AppKit builds trackpad touches only for a multitouch device it knows, so the pad's touches are filed under the Mac's own trackpad, preferring the built-in one.
+static bool findMultitouchDevice(void) {
+	io_iterator_t iterator;
+	if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("AppleMultitouchDevice"), &iterator) != KERN_SUCCESS) {
+		return false;
+	}
+
+	bool foundBuiltIn = false;
+	for (io_service_t service = IOIteratorNext(iterator); service; service = IOIteratorNext(iterator)) {
+		CFTypeRef deviceId = IORegistryEntryCreateCFProperty(service, CFSTR("Multitouch ID"), kCFAllocatorDefault, 0);
+		CFTypeRef builtIn = IORegistryEntryCreateCFProperty(service, CFSTR("MT Built-In"), kCFAllocatorDefault, 0);
+		uint64_t registryId = 0;
+		bool isBuiltIn = builtIn && CFEqual(builtIn, kCFBooleanTrue);
+		if (deviceId && CFGetTypeID(deviceId) == CFNumberGetTypeID() && IORegistryEntryGetRegistryEntryID(service, &registryId) == KERN_SUCCESS && (isBuiltIn || !multitouchRegistryId)) {
+			CFNumberGetValue(deviceId, kCFNumberSInt64Type, &multitouchDeviceId);
+			multitouchRegistryId = registryId;
+			foundBuiltIn = isBuiltIn;
+		}
+
+		if (deviceId) {
+			CFRelease(deviceId);
+		}
+
+		if (builtIn) {
+			CFRelease(builtIn);
+		}
+
+		IOObjectRelease(service);
+		if (foundBuiltIn) {
+			break;
+		}
+	}
+
+	IOObjectRelease(iterator);
+	return multitouchRegistryId != 0 && multitouchDeviceId != 0;
+}
+
+static bool loadTouchApi(void) {
+	void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+	void *skylight = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW);
+	if (!iokit || !skylight) {
+		return false;
+	}
+
+	touchApi.createDigitizer = dlsym(iokit, "IOHIDEventCreateDigitizerEvent");
+	touchApi.createFinger = dlsym(iokit, "IOHIDEventCreateDigitizerFingerEvent");
+	touchApi.createVendorDefined = dlsym(iokit, "IOHIDEventCreateVendorDefinedEvent");
+	touchApi.setSenderID = dlsym(iokit, "IOHIDEventSetSenderID");
+	touchApi.setIntegerValue = dlsym(iokit, "IOHIDEventSetIntegerValue");
+	touchApi.appendEvent = dlsym(iokit, "IOHIDEventAppendEvent");
+	touchApi.attachToEvent = dlsym(skylight, "SLEventSetIOHIDEvent");
+	bool loaded = touchApi.createDigitizer && touchApi.createFinger && touchApi.createVendorDefined && touchApi.setSenderID && touchApi.setIntegerValue && touchApi.appendEvent && touchApi.attachToEvent;
+	return loaded && findMultitouchDevice();
+}
+
 static CFNumberRef createNumber(int value) {
 	return CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &value);
 }
@@ -1144,6 +1347,7 @@ int main(int argc, char **argv) {
 	}
 
 	dockSwipesAvailable = loadDockSwipeApi();
+	touchEventsAvailable = loadTouchApi();
 	eventSource = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
 	CGEventSourceSetLocalEventsSuppressionInterval(eventSource, 0);
 
@@ -1165,7 +1369,7 @@ int main(int argc, char **argv) {
 	CFRunLoopTimerRef timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + MODE_REFRESH_SECONDS, MODE_REFRESH_SECONDS, 0, 0, onRefreshTimer, NULL);
 	CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopDefaultMode);
 
-	logLine("started: speed %.2f, verbose: %s, accessibility: %s, input monitoring: %s, dock swipes: %s, HID manager open: 0x%08x", speedFactor, yesNo(verbose), yesNo(accessibilityTrusted), yesNo(inputMonitoringGranted), yesNo(dockSwipesAvailable), openResult);
+	logLine("started: speed %.2f, verbose: %s, accessibility: %s, input monitoring: %s, dock swipes: %s, touches: %s, HID manager open: 0x%08x", speedFactor, yesNo(verbose), yesNo(accessibilityTrusted), yesNo(inputMonitoringGranted), yesNo(dockSwipesAvailable), yesNo(touchEventsAvailable), openResult);
 	CFRunLoopRun();
 	return 0;
 }
