@@ -1,0 +1,821 @@
+#include <ApplicationServices/ApplicationServices.h>
+#include <IOKit/hid/IOHIDManager.h>
+#include <IOKit/hidsystem/IOHIDLib.h>
+#include <dlfcn.h>
+#include <math.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+enum {
+	VENDOR_ID = 0x048D,
+	PRODUCT_ID = 0x8911,
+	REPORT_ID_INPUT_MODE = 3,
+	REPORT_ID_TOUCH = 4,
+	INPUT_MODE_TOUCHPAD = 3,
+	TOUCH_REPORT_LENGTH = 30,
+	MAX_CONTACTS = 5,
+	CONTACT_LENGTH = 5,
+	CONTACT_COUNT_OFFSET = 28,
+	KEY_CODE_LEFT_ARROW = 0x7B,
+	KEY_CODE_RIGHT_ARROW = 0x7C,
+	KEY_CODE_DOWN_ARROW = 0x7D,
+	KEY_CODE_UP_ARROW = 0x7E,
+	// Undocumented CGEvent type that carries Dock gestures such as swipes between Spaces.
+	CG_EVENT_TYPE_DOCK_SWIPE = 30,
+};
+
+// From Apple's open-source IOHIDFamily (IOHIDEventTypes.h, IOHIDEventFieldDefs.h); the SDK doesn't ship them.
+enum {
+	HID_EVENT_TYPE_VELOCITY = 9,
+	HID_EVENT_TYPE_DOCK_SWIPE = 23,
+	HID_FIELD_VELOCITY_X = HID_EVENT_TYPE_VELOCITY << 16,
+	HID_FIELD_VELOCITY_Y = HID_EVENT_TYPE_VELOCITY << 16 | 1,
+	HID_FIELD_DOCK_SWIPE_MOTION = HID_EVENT_TYPE_DOCK_SWIPE << 16 | 1,
+	HID_FIELD_DOCK_SWIPE_PROGRESS = HID_EVENT_TYPE_DOCK_SWIPE << 16 | 2,
+	HID_FIELD_DOCK_SWIPE_FLAVOR = HID_EVENT_TYPE_DOCK_SWIPE << 16 | 5,
+	HID_GESTURE_MOTION_HORIZONTAL = 1,
+	HID_GESTURE_MOTION_VERTICAL = 2,
+	HID_GESTURE_FLAVOR_DOCK_PRIMARY = 3,
+	HID_PHASE_BEGAN = 1 << 0,
+	HID_PHASE_CHANGED = 1 << 1,
+	HID_PHASE_ENDED = 1 << 2,
+	HID_PHASE_CANCELLED = 1 << 3,
+	HID_EVENT_PHASE_SHIFT = 24,
+};
+
+// Logical range 0-1599 over a physical width of 4.61 in, per the report descriptor; Y has the same density.
+static const double COUNTS_PER_MM = 1599.0 / 117.1;
+
+static const double TAP_MAX_SECONDS = 0.25;
+static const double TAP_MAX_TRAVEL_MM = 2.0;
+static const double TAP_DRAG_WINDOW_SECONDS = 0.3;
+static const double DOUBLE_CLICK_SECONDS = 0.5;
+static const double DRAG_LOCK_SECONDS = 1.0;
+static const double SWIPE_MIN_TRAVEL_MM = 10.0;
+static const double DOCK_SWIPE_LOCK_TRAVEL_MM = 3.0;
+static const double DOCK_SWIPE_PROGRESS_PER_MM_HORIZONTAL = 1.0 / 50.0;
+static const double DOCK_SWIPE_PROGRESS_PER_MM_VERTICAL = -1.0 / 40.0;
+static const double TRACKING_MULTIPLIER_AT_ZERO = 0.25;
+static const double SCROLL_GAIN = 6.0;
+static const double MODE_REFRESH_SECONDS = 10.0;
+
+typedef struct {
+	double speed;
+	double gain;
+} CurvePoint;
+
+// Median cursor points per mm of finger travel, by finger speed in mm/s, measured on the built-in trackpad of a 14-inch MacBook Pro (Mac16,8) at Tracking speed 1.0.
+static const CurvePoint POINTER_CURVE[] = {
+	{0, 3.0},
+	{30, 6.4},
+	{50, 9.7},
+	{70, 10.6},
+	{90, 12.3},
+	{115, 16.3},
+	{145, 17.3},
+	{180, 22.5},
+	{225, 27.8},
+	{275, 32.9},
+	{350, 39.2},
+	{450, 49.0},
+	{600, 52.9},
+	{850, 60.8},
+};
+
+typedef struct {
+	int count;
+	unsigned idMask;
+	double x;
+	double y;
+} Touch;
+
+typedef struct {
+	bool touching;
+	double touchStart;
+	int maxFingers;
+	double travel;
+	double smoothedSpeed;
+	double peakSpeed;
+	double pointerFingerTravel;
+	double pointerCursorTravel;
+	bool armedForDrag;
+	bool dragging;
+	bool referenceValid;
+	unsigned referenceMask;
+	double referenceX;
+	double referenceY;
+	double referenceTime;
+	double cursorX;
+	double cursorY;
+	double lastTapEnd;
+	int clickCount;
+	double scrollRemainderX;
+	double scrollRemainderY;
+	double swipeX;
+	double swipeY;
+	bool swiped;
+	int swipeMotion;
+	double swipeProgress;
+	double swipeVelocity;
+	bool naturalScrolling;
+	double trackingMultiplier;
+} Gesture;
+
+typedef struct {
+	const char *direction;
+	CGKeyCode keyCode;
+	const char *action;
+} Swipe;
+
+typedef struct __IOHIDEvent *IOHIDEventRef;
+
+// Private IOKit and SkyLight functions that build the gesture events Apple's trackpads send; none of them is in the SDK.
+typedef struct {
+	IOHIDEventRef (*create)(CFAllocatorRef allocator, uint32_t type, uint64_t timestamp, uint32_t options);
+	void (*setEventFlags)(IOHIDEventRef event, uint32_t flags);
+	void (*setIntegerValue)(IOHIDEventRef event, uint32_t field, CFIndex value);
+	void (*setDoubleValue)(IOHIDEventRef event, uint32_t field, double value);
+	void (*appendEvent)(IOHIDEventRef parent, IOHIDEventRef child, uint32_t options);
+	void (*attachToEvent)(CGEventRef event, IOHIDEventRef hidEvent);
+} DockSwipeApi;
+
+static Gesture gesture;
+static DockSwipeApi dockSwipeApi;
+static bool dockSwipesAvailable;
+static CGEventSourceRef eventSource;
+static CFRunLoopTimerRef dragReleaseTimer;
+static IOHIDDeviceRef touchpad;
+static double speedFactor = 1.0;
+static bool verbose;
+static bool accessibilityTrusted;
+static bool inputMonitoringGranted;
+static double loggedTrackingScaling = -1;
+
+static double now(void) {
+	struct timespec spec;
+	clock_gettime(CLOCK_MONOTONIC, &spec);
+	return spec.tv_sec + spec.tv_nsec / 1e9;
+}
+
+static void logArguments(const char *format, va_list arguments) {
+	char stamp[32];
+	time_t seconds = time(NULL);
+	strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", localtime(&seconds));
+	printf("%s ", stamp);
+	vprintf(format, arguments);
+	printf("\n");
+}
+
+static void logLine(const char *format, ...) {
+	va_list arguments;
+	va_start(arguments, format);
+	logArguments(format, arguments);
+	va_end(arguments);
+}
+
+static void logVerbose(const char *format, ...) {
+	if (!verbose) {
+		return;
+	}
+
+	va_list arguments;
+	va_start(arguments, format);
+	logArguments(format, arguments);
+	va_end(arguments);
+}
+
+static const char *yesNo(bool value) {
+	if (value) {
+		return "yes";
+	}
+
+	return "no";
+}
+
+static bool readNaturalScrolling(void) {
+	CFPropertyListRef value = CFPreferencesCopyAppValue(CFSTR("com.apple.swipescrolldirection"), kCFPreferencesAnyApplication);
+	bool natural = true;
+	if (value) {
+		if (CFGetTypeID(value) == CFBooleanGetTypeID()) {
+			natural = CFBooleanGetValue(value);
+		}
+
+		CFRelease(value);
+	}
+
+	return natural;
+}
+
+// Maps the Trackpad "Tracking speed" slider (0 to 3) linearly onto a pointer multiplier that is 1 at the slider's 1.0 notch.
+static double readTrackingMultiplier(void) {
+	CFPropertyListRef value = CFPreferencesCopyAppValue(CFSTR("com.apple.trackpad.scaling"), kCFPreferencesAnyApplication);
+	double scaling = 1.0;
+	if (value) {
+		if (CFGetTypeID(value) == CFNumberGetTypeID()) {
+			CFNumberGetValue(value, kCFNumberDoubleType, &scaling);
+		}
+
+		CFRelease(value);
+	}
+
+	double multiplier = TRACKING_MULTIPLIER_AT_ZERO + (1.0 - TRACKING_MULTIPLIER_AT_ZERO) * scaling;
+	if (scaling != loggedTrackingScaling) {
+		loggedTrackingScaling = scaling;
+		logLine("tracking speed: %.4f (pointer multiplier %.3f)", scaling, multiplier);
+	}
+
+	return multiplier;
+}
+
+static Touch parseTouch(const uint8_t *report) {
+	Touch touch = {0};
+	int slots = report[CONTACT_COUNT_OFFSET];
+	if (slots > MAX_CONTACTS) {
+		slots = MAX_CONTACTS;
+	}
+
+	for (int i = 0; i < slots; i++) {
+		const uint8_t *contact = report + 1 + i * CONTACT_LENGTH;
+		bool confident = contact[0] & 0x01;
+		bool tipDown = contact[0] & 0x02;
+		if (!confident || !tipDown) {
+			continue;
+		}
+
+		touch.count++;
+		touch.idMask |= 1u << ((contact[0] >> 2) & 0x07);
+		touch.x += (contact[1] | contact[2] << 8) / COUNTS_PER_MM;
+		touch.y += (contact[3] | contact[4] << 8) / COUNTS_PER_MM;
+	}
+
+	if (touch.count > 0) {
+		touch.x /= touch.count;
+		touch.y /= touch.count;
+	}
+
+	return touch;
+}
+
+static void syncCursor(void) {
+	CGEventRef event = CGEventCreate(NULL);
+	CGPoint location = CGEventGetLocation(event);
+	CFRelease(event);
+	gesture.cursorX = location.x;
+	gesture.cursorY = location.y;
+}
+
+static CGPoint clampToDisplays(CGPoint from, CGPoint to) {
+	CGDirectDisplayID display;
+	uint32_t count = 0;
+	CGGetDisplaysWithPoint(to, 1, &display, &count);
+	if (count > 0) {
+		return to;
+	}
+
+	CGGetDisplaysWithPoint(from, 1, &display, &count);
+	if (count == 0) {
+		display = CGMainDisplayID();
+	}
+
+	CGRect bounds = CGDisplayBounds(display);
+	to.x = fmin(fmax(to.x, CGRectGetMinX(bounds)), CGRectGetMaxX(bounds) - 1);
+	to.y = fmin(fmax(to.y, CGRectGetMinY(bounds)), CGRectGetMaxY(bounds) - 1);
+	return to;
+}
+
+static void postMouse(CGEventType type, CGMouseButton button, int64_t clickState, int64_t deltaX, int64_t deltaY) {
+	CGEventRef event = CGEventCreateMouseEvent(eventSource, type, CGPointMake(gesture.cursorX, gesture.cursorY), button);
+	if (!event) {
+		return;
+	}
+
+	CGEventSetIntegerValueField(event, kCGMouseEventClickState, clickState);
+	CGEventSetIntegerValueField(event, kCGMouseEventDeltaX, deltaX);
+	CGEventSetIntegerValueField(event, kCGMouseEventDeltaY, deltaY);
+	CGEventPost(kCGHIDEventTap, event);
+	CFRelease(event);
+}
+
+static void click(CGMouseButton button, int64_t clickState) {
+	CGEventType downType = kCGEventOtherMouseDown;
+	CGEventType upType = kCGEventOtherMouseUp;
+	if (button == kCGMouseButtonLeft) {
+		downType = kCGEventLeftMouseDown;
+		upType = kCGEventLeftMouseUp;
+	} else if (button == kCGMouseButtonRight) {
+		downType = kCGEventRightMouseDown;
+		upType = kCGEventRightMouseUp;
+	}
+
+	postMouse(downType, button, clickState, 0, 0);
+	postMouse(upType, button, clickState, 0, 0);
+}
+
+static void postKey(CGKeyCode keyCode, bool keyDown, CGEventFlags flags) {
+	CGEventRef event = CGEventCreateKeyboardEvent(eventSource, keyCode, keyDown);
+	if (!event) {
+		return;
+	}
+
+	CGEventSetFlags(event, flags);
+	CGEventPost(kCGHIDEventTap, event);
+	CFRelease(event);
+}
+
+// The default Mission Control shortcuts are registered with the Fn flag that arrow keys carry.
+static void pressControlArrow(CGKeyCode keyCode) {
+	CGEventFlags flags = kCGEventFlagMaskControl | kCGEventFlagMaskSecondaryFn;
+	postKey(keyCode, true, flags);
+	postKey(keyCode, false, flags);
+}
+
+static double pointerGain(double speed) {
+	size_t count = sizeof(POINTER_CURVE) / sizeof(POINTER_CURVE[0]);
+	if (speed <= POINTER_CURVE[0].speed) {
+		return POINTER_CURVE[0].gain;
+	}
+
+	for (size_t i = 1; i < count; i++) {
+		if (speed <= POINTER_CURVE[i].speed) {
+			CurvePoint low = POINTER_CURVE[i - 1];
+			CurvePoint high = POINTER_CURVE[i];
+			return low.gain + (high.gain - low.gain) * (speed - low.speed) / (high.speed - low.speed);
+		}
+	}
+
+	return POINTER_CURVE[count - 1].gain;
+}
+
+static void moveCursor(double dxMm, double dyMm, double seconds) {
+	double speed = hypot(dxMm, dyMm) / seconds;
+	gesture.smoothedSpeed = 0.7 * gesture.smoothedSpeed + 0.3 * speed;
+	double scale = pointerGain(gesture.smoothedSpeed) * speedFactor * gesture.trackingMultiplier;
+	CGPoint from = CGPointMake(gesture.cursorX, gesture.cursorY);
+	CGPoint to = clampToDisplays(from, CGPointMake(from.x + dxMm * scale, from.y + dyMm * scale));
+	int64_t deltaX = llround(to.x) - llround(from.x);
+	int64_t deltaY = llround(to.y) - llround(from.y);
+	gesture.cursorX = to.x;
+	gesture.cursorY = to.y;
+	gesture.peakSpeed = fmax(gesture.peakSpeed, gesture.smoothedSpeed);
+	gesture.pointerFingerTravel += hypot(dxMm, dyMm);
+	gesture.pointerCursorTravel += hypot(to.x - from.x, to.y - from.y);
+	if (gesture.dragging) {
+		postMouse(kCGEventLeftMouseDragged, kCGMouseButtonLeft, 1, deltaX, deltaY);
+	} else {
+		postMouse(kCGEventMouseMoved, kCGMouseButtonLeft, 0, deltaX, deltaY);
+	}
+}
+
+static void scroll(double dxMm, double dyMm) {
+	double direction = 1.0;
+	if (!gesture.naturalScrolling) {
+		direction = -1.0;
+	}
+
+	gesture.scrollRemainderX += dxMm * SCROLL_GAIN * direction;
+	gesture.scrollRemainderY += dyMm * SCROLL_GAIN * direction;
+	int32_t wheelX = (int32_t)trunc(gesture.scrollRemainderX);
+	int32_t wheelY = (int32_t)trunc(gesture.scrollRemainderY);
+	if (wheelX == 0 && wheelY == 0) {
+		return;
+	}
+
+	gesture.scrollRemainderX -= wheelX;
+	gesture.scrollRemainderY -= wheelY;
+	CGEventRef event = CGEventCreateScrollWheelEvent2(eventSource, kCGScrollEventUnitPixel, 2, wheelY, wheelX, 0);
+	if (!event) {
+		return;
+	}
+
+	CGEventSetIntegerValueField(event, kCGScrollWheelEventIsContinuous, 1);
+	CGEventPost(kCGHIDEventTap, event);
+	CFRelease(event);
+}
+
+// Pad Y grows toward the user, and Spaces follow the fingers as on Apple's trackpads: swiping left brings in the Space on the right.
+static Swipe classifySwipe(double dxMm, double dyMm) {
+	if (fabs(dxMm) > fabs(dyMm)) {
+		if (dxMm < 0) {
+			return (Swipe){"left", KEY_CODE_RIGHT_ARROW, "Space on the right"};
+		}
+
+		return (Swipe){"right", KEY_CODE_LEFT_ARROW, "Space on the left"};
+	}
+
+	if (dyMm < 0) {
+		return (Swipe){"up", KEY_CODE_UP_ARROW, "Mission Control"};
+	}
+
+	return (Swipe){"down", KEY_CODE_DOWN_ARROW, "App Exposé"};
+}
+
+// Without the private gesture API, a swipe falls back to the Mission Control keyboard shortcuts, fired once per touch.
+static void triggerShortcutSwipe(double dxMm, double dyMm) {
+	if (gesture.swiped) {
+		return;
+	}
+
+	gesture.swipeX += dxMm;
+	gesture.swipeY += dyMm;
+	if (hypot(gesture.swipeX, gesture.swipeY) < SWIPE_MIN_TRAVEL_MM) {
+		return;
+	}
+
+	gesture.swiped = true;
+	Swipe swipe = classifySwipe(gesture.swipeX, gesture.swipeY);
+	pressControlArrow(swipe.keyCode);
+	logVerbose("swipe %s: %s", swipe.direction, swipe.action);
+}
+
+static void postDockSwipe(uint32_t phase, double exitVelocity) {
+	IOHIDEventRef swipe = dockSwipeApi.create(kCFAllocatorDefault, HID_EVENT_TYPE_DOCK_SWIPE, 0, 0);
+	if (!swipe) {
+		return;
+	}
+
+	dockSwipeApi.setEventFlags(swipe, phase << HID_EVENT_PHASE_SHIFT);
+	dockSwipeApi.setIntegerValue(swipe, HID_FIELD_DOCK_SWIPE_MOTION, gesture.swipeMotion);
+	dockSwipeApi.setIntegerValue(swipe, HID_FIELD_DOCK_SWIPE_FLAVOR, HID_GESTURE_FLAVOR_DOCK_PRIMARY);
+	dockSwipeApi.setDoubleValue(swipe, HID_FIELD_DOCK_SWIPE_PROGRESS, gesture.swipeProgress);
+	if (phase == HID_PHASE_ENDED || phase == HID_PHASE_CANCELLED) {
+		IOHIDEventRef velocity = dockSwipeApi.create(kCFAllocatorDefault, HID_EVENT_TYPE_VELOCITY, 0, 0);
+		if (velocity) {
+			dockSwipeApi.setDoubleValue(velocity, HID_FIELD_VELOCITY_X, exitVelocity);
+			dockSwipeApi.setDoubleValue(velocity, HID_FIELD_VELOCITY_Y, exitVelocity);
+			dockSwipeApi.appendEvent(swipe, velocity, 0);
+			CFRelease(velocity);
+		}
+	}
+
+	CGEventRef event = CGEventCreate(NULL);
+	if (event) {
+		CGEventSetType(event, (CGEventType)CG_EVENT_TYPE_DOCK_SWIPE);
+		dockSwipeApi.attachToEvent(event, swipe);
+		CGEventPost(kCGHIDEventTap, event);
+		CFRelease(event);
+	}
+
+	CFRelease(swipe);
+}
+
+static double swipeProgressDelta(double dxMm, double dyMm) {
+	if (gesture.swipeMotion == HID_GESTURE_MOTION_HORIZONTAL) {
+		return dxMm * DOCK_SWIPE_PROGRESS_PER_MM_HORIZONTAL;
+	}
+
+	return dyMm * DOCK_SWIPE_PROGRESS_PER_MM_VERTICAL;
+}
+
+// As on Apple's trackpads, the swipe locks to one axis and the Dock follows the fingers, holding wherever they stop.
+static void trackDockSwipe(double dxMm, double dyMm, double seconds) {
+	if (gesture.swipeMotion == 0) {
+		gesture.swipeX += dxMm;
+		gesture.swipeY += dyMm;
+		if (hypot(gesture.swipeX, gesture.swipeY) <= DOCK_SWIPE_LOCK_TRAVEL_MM) {
+			return;
+		}
+
+		gesture.swipeMotion = HID_GESTURE_MOTION_VERTICAL;
+		if (fabs(gesture.swipeX) > fabs(gesture.swipeY)) {
+			gesture.swipeMotion = HID_GESTURE_MOTION_HORIZONTAL;
+		}
+
+		gesture.swipeProgress = swipeProgressDelta(gesture.swipeX, gesture.swipeY);
+		gesture.swipeVelocity = 0;
+		postDockSwipe(HID_PHASE_BEGAN, 0);
+		logVerbose("dock swipe began: motion %d, progress %.3f", gesture.swipeMotion, gesture.swipeProgress);
+		return;
+	}
+
+	double delta = swipeProgressDelta(dxMm, dyMm);
+	gesture.swipeVelocity = 0.7 * gesture.swipeVelocity + 0.3 * delta / seconds;
+	if (delta == 0) {
+		return;
+	}
+
+	gesture.swipeProgress += delta;
+	postDockSwipe(HID_PHASE_CHANGED, 0);
+}
+
+static void finishDockSwipe(void) {
+	if (gesture.swipeMotion == 0) {
+		return;
+	}
+
+	// Lifting while the fingers head back toward where they started snaps the swipe back.
+	uint32_t phase = HID_PHASE_ENDED;
+	const char *outcome = "ended";
+	if (gesture.swipeVelocity * gesture.swipeProgress < 0) {
+		phase = HID_PHASE_CANCELLED;
+		outcome = "canceled";
+	}
+
+	postDockSwipe(phase, gesture.swipeVelocity);
+	logVerbose("dock swipe %s: progress %.3f, velocity %.3f/s", outcome, gesture.swipeProgress, gesture.swipeVelocity);
+	gesture.swipeMotion = 0;
+}
+
+static void cancelDragRelease(void) {
+	if (!dragReleaseTimer) {
+		return;
+	}
+
+	CFRunLoopTimerInvalidate(dragReleaseTimer);
+	CFRelease(dragReleaseTimer);
+	dragReleaseTimer = NULL;
+}
+
+static void releaseDrag(void) {
+	cancelDragRelease();
+	if (!gesture.dragging) {
+		return;
+	}
+
+	gesture.dragging = false;
+	postMouse(kCGEventLeftMouseUp, kCGMouseButtonLeft, 1, 0, 0);
+	logVerbose("drag end");
+}
+
+static void onDragReleaseTimer(CFRunLoopTimerRef timer, void *info) {
+	releaseDrag();
+}
+
+static void scheduleDragRelease(void) {
+	cancelDragRelease();
+	dragReleaseTimer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + DRAG_LOCK_SECONDS, 0, 0, 0, onDragReleaseTimer, NULL);
+	CFRunLoopAddTimer(CFRunLoopGetCurrent(), dragReleaseTimer, kCFRunLoopDefaultMode);
+}
+
+static void beginTouch(double time) {
+	if (gesture.dragging) {
+		cancelDragRelease();
+		logVerbose("drag resumed");
+	}
+
+	gesture.touching = true;
+	gesture.touchStart = time;
+	gesture.maxFingers = 0;
+	gesture.travel = 0;
+	gesture.smoothedSpeed = 0;
+	gesture.peakSpeed = 0;
+	gesture.pointerFingerTravel = 0;
+	gesture.pointerCursorTravel = 0;
+	gesture.referenceValid = false;
+	gesture.scrollRemainderX = 0;
+	gesture.scrollRemainderY = 0;
+	gesture.swipeX = 0;
+	gesture.swipeY = 0;
+	gesture.swiped = false;
+	gesture.armedForDrag = time - gesture.lastTapEnd <= TAP_DRAG_WINDOW_SECONDS;
+	CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
+	gesture.naturalScrolling = readNaturalScrolling();
+	gesture.trackingMultiplier = readTrackingMultiplier();
+	syncCursor();
+}
+
+static void endTouch(double time) {
+	bool isTap = time - gesture.touchStart <= TAP_MAX_SECONDS && gesture.travel <= TAP_MAX_TRAVEL_MM;
+	gesture.touching = false;
+	gesture.referenceValid = false;
+	if (gesture.pointerFingerTravel > TAP_MAX_TRAVEL_MM) {
+		logVerbose("pointer: finger %.1f mm, cursor %.0f pt, average %.1f pt/mm, peak speed %.0f mm/s", gesture.pointerFingerTravel, gesture.pointerCursorTravel, gesture.pointerCursorTravel / gesture.pointerFingerTravel, gesture.peakSpeed);
+	}
+
+	finishDockSwipe();
+	// As with "Without Drag Lock", a drag outlives a brief lift so the finger can be re-placed; a tap drops it at once.
+	if (gesture.dragging) {
+		if (isTap) {
+			releaseDrag();
+		} else {
+			scheduleDragRelease();
+			logVerbose("drag lifted; held for %.1f s", DRAG_LOCK_SECONDS);
+		}
+
+		gesture.lastTapEnd = 0;
+		return;
+	}
+
+	if (!isTap) {
+		gesture.lastTapEnd = 0;
+		return;
+	}
+
+	switch (gesture.maxFingers) {
+		case 1:
+			if (time - gesture.lastTapEnd <= DOUBLE_CLICK_SECONDS) {
+				gesture.clickCount++;
+			} else {
+				gesture.clickCount = 1;
+			}
+
+			click(kCGMouseButtonLeft, gesture.clickCount);
+			gesture.lastTapEnd = time;
+			logVerbose("tap: left click (count %d)", gesture.clickCount);
+			break;
+		case 2:
+			click(kCGMouseButtonRight, 1);
+			gesture.lastTapEnd = 0;
+			logVerbose("tap: right click");
+			break;
+		case 3:
+			click(kCGMouseButtonCenter, 1);
+			gesture.lastTapEnd = 0;
+			logVerbose("tap: middle click");
+			break;
+		default:
+			gesture.lastTapEnd = 0;
+			break;
+	}
+}
+
+static void handleTouch(const Touch *touch, double time) {
+	if (touch->count == 0) {
+		if (gesture.touching) {
+			endTouch(time);
+		}
+
+		return;
+	}
+
+	if (!gesture.touching) {
+		beginTouch(time);
+	}
+
+	if (touch->count > gesture.maxFingers) {
+		gesture.maxFingers = touch->count;
+	}
+
+	// Re-anchor whenever the set of fingers changes, so a finger landing or lifting never reads as movement.
+	if (!gesture.referenceValid || touch->idMask != gesture.referenceMask) {
+		gesture.referenceValid = true;
+		gesture.referenceMask = touch->idMask;
+		gesture.referenceX = touch->x;
+		gesture.referenceY = touch->y;
+		gesture.referenceTime = time;
+		return;
+	}
+
+	double dx = touch->x - gesture.referenceX;
+	double dy = touch->y - gesture.referenceY;
+	double seconds = fmax(time - gesture.referenceTime, 0.001);
+	gesture.referenceX = touch->x;
+	gesture.referenceY = touch->y;
+	gesture.referenceTime = time;
+	gesture.travel += hypot(dx, dy);
+
+	// A touch acts only at its peak finger count, so lifting out of a scroll never nudges the pointer and lifting out of a swipe never scrolls.
+	if (touch->count == 1 && gesture.maxFingers == 1) {
+		bool heldPastTap = gesture.travel > TAP_MAX_TRAVEL_MM || time - gesture.touchStart > TAP_MAX_SECONDS;
+		if (gesture.armedForDrag && !gesture.dragging && heldPastTap) {
+			gesture.dragging = true;
+			postMouse(kCGEventLeftMouseDown, kCGMouseButtonLeft, 1, 0, 0);
+			logVerbose("drag start");
+		}
+
+		moveCursor(dx, dy, seconds);
+	} else if (touch->count == 2 && gesture.maxFingers == 2) {
+		scroll(dx, dy);
+	} else if (touch->count == 3 && gesture.maxFingers == 3) {
+		if (dockSwipesAvailable) {
+			trackDockSwipe(dx, dy, seconds);
+		} else {
+			triggerShortcutSwipe(dx, dy);
+		}
+	}
+}
+
+static void resetGesture(void) {
+	releaseDrag();
+	finishDockSwipe();
+	gesture.touching = false;
+	gesture.referenceValid = false;
+	gesture.lastTapEnd = 0;
+}
+
+static IOReturn setTouchpadMode(IOHIDDeviceRef device) {
+	uint8_t report[] = {REPORT_ID_INPUT_MODE, INPUT_MODE_TOUCHPAD};
+	return IOHIDDeviceSetReport(device, kIOHIDReportTypeFeature, REPORT_ID_INPUT_MODE, report, sizeof(report));
+}
+
+static void onInputReport(void *context, IOReturn result, void *sender, IOHIDReportType type, uint32_t reportId, uint8_t *report, CFIndex length) {
+	if (reportId != REPORT_ID_TOUCH || length < TOUCH_REPORT_LENGTH) {
+		return;
+	}
+
+	Touch touch = parseTouch(report);
+	handleTouch(&touch, now());
+}
+
+static void onDeviceMatched(void *context, IOReturn result, void *sender, IOHIDDeviceRef device) {
+	touchpad = device;
+	resetGesture();
+	logLine("touchpad connected; switching to touchpad mode: 0x%08x", setTouchpadMode(device));
+}
+
+static void onDeviceRemoved(void *context, IOReturn result, void *sender, IOHIDDeviceRef device) {
+	if (device == touchpad) {
+		touchpad = NULL;
+	}
+
+	resetGesture();
+	logLine("touchpad disconnected");
+}
+
+static bool checkInputMonitoring(void) {
+	return IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted;
+}
+
+// The firmware sends nothing at all in its power-on mode, so re-assert touchpad mode in case the pad gets reset without being re-enumerated, as can happen around sleep.
+static void onRefreshTimer(CFRunLoopTimerRef timer, void *info) {
+	bool trusted = AXIsProcessTrusted();
+	bool listening = checkInputMonitoring();
+	// Exit on a newly granted permission and let launchd's KeepAlive start a fresh process that opens the pad with it.
+	if ((trusted && !accessibilityTrusted) || (listening && !inputMonitoringGranted)) {
+		logLine("permission granted (accessibility: %s, input monitoring: %s); restarting", yesNo(trusted), yesNo(listening));
+		exit(0);
+	}
+
+	if (!touchpad || gesture.touching) {
+		return;
+	}
+
+	IOReturn result = setTouchpadMode(touchpad);
+	if (result != kIOReturnSuccess) {
+		logLine("re-asserting touchpad mode failed: 0x%08x", result);
+	}
+}
+
+static bool loadDockSwipeApi(void) {
+	void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+	void *skylight = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW);
+	if (!iokit || !skylight) {
+		return false;
+	}
+
+	dockSwipeApi.create = dlsym(iokit, "IOHIDEventCreate");
+	dockSwipeApi.setEventFlags = dlsym(iokit, "IOHIDEventSetEventFlags");
+	dockSwipeApi.setIntegerValue = dlsym(iokit, "IOHIDEventSetIntegerValue");
+	dockSwipeApi.setDoubleValue = dlsym(iokit, "IOHIDEventSetDoubleValue");
+	dockSwipeApi.appendEvent = dlsym(iokit, "IOHIDEventAppendEvent");
+	dockSwipeApi.attachToEvent = dlsym(skylight, "SLEventSetIOHIDEvent");
+	return dockSwipeApi.create && dockSwipeApi.setEventFlags && dockSwipeApi.setIntegerValue && dockSwipeApi.setDoubleValue && dockSwipeApi.appendEvent && dockSwipeApi.attachToEvent;
+}
+
+static CFNumberRef createNumber(int value) {
+	return CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &value);
+}
+
+int main(int argc, char **argv) {
+	setvbuf(stdout, NULL, _IOLBF, 0);
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--speed") == 0 && i + 1 < argc) {
+			i++;
+			double requested = strtod(argv[i], NULL);
+			if (requested > 0) {
+				speedFactor = requested;
+			}
+		} else if (strcmp(argv[i], "--verbose") == 0) {
+			verbose = true;
+		}
+	}
+
+	const void *promptKeys[] = {kAXTrustedCheckOptionPrompt};
+	const void *promptValues[] = {kCFBooleanTrue};
+	CFDictionaryRef promptOptions = CFDictionaryCreate(kCFAllocatorDefault, promptKeys, promptValues, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	accessibilityTrusted = AXIsProcessTrustedWithOptions(promptOptions);
+	CFRelease(promptOptions);
+	inputMonitoringGranted = checkInputMonitoring();
+	if (!inputMonitoringGranted) {
+		IOHIDRequestAccess(kIOHIDRequestTypeListenEvent);
+	}
+
+	dockSwipesAvailable = loadDockSwipeApi();
+	eventSource = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+	CGEventSourceSetLocalEventsSuppressionInterval(eventSource, 0);
+
+	IOHIDManagerRef manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+	CFNumberRef vendor = createNumber(VENDOR_ID);
+	CFNumberRef product = createNumber(PRODUCT_ID);
+	CFNumberRef usagePage = createNumber(kHIDPage_GenericDesktop);
+	CFNumberRef usage = createNumber(kHIDUsage_GD_Mouse);
+	const void *matchKeys[] = {CFSTR(kIOHIDVendorIDKey), CFSTR(kIOHIDProductIDKey), CFSTR(kIOHIDPrimaryUsagePageKey), CFSTR(kIOHIDPrimaryUsageKey)};
+	const void *matchValues[] = {vendor, product, usagePage, usage};
+	CFDictionaryRef matching = CFDictionaryCreate(kCFAllocatorDefault, matchKeys, matchValues, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	IOHIDManagerSetDeviceMatching(manager, matching);
+	IOHIDManagerRegisterDeviceMatchingCallback(manager, onDeviceMatched, NULL);
+	IOHIDManagerRegisterDeviceRemovalCallback(manager, onDeviceRemoved, NULL);
+	IOHIDManagerRegisterInputReportCallback(manager, onInputReport, NULL);
+	IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+	IOReturn openResult = IOHIDManagerOpen(manager, kIOHIDOptionsTypeNone);
+
+	CFRunLoopTimerRef timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + MODE_REFRESH_SECONDS, MODE_REFRESH_SECONDS, 0, 0, onRefreshTimer, NULL);
+	CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopDefaultMode);
+
+	logLine("started: speed %.2f, verbose: %s, accessibility: %s, input monitoring: %s, dock swipes: %s, HID manager open: 0x%08x", speedFactor, yesNo(verbose), yesNo(accessibilityTrusted), yesNo(inputMonitoringGranted), yesNo(dockSwipesAvailable), openResult);
+	CFRunLoopRun();
+	return 0;
+}

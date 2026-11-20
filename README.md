@@ -1,0 +1,94 @@
+# htx-touchpad
+
+A small macOS background helper that makes the "HTX HID Device" USB touchpad usable on a Mac.
+
+The device is USB `048D:8911` with the serial `MIIX320_HTK_V7T_HTP`; its firmware appears to come from a Lenovo Miix 320 keyboard dock.
+
+## Why this exists
+
+The pad is a Windows Precision Touchpad, and macOS has no driver for that protocol.
+
+- In its power-on mouse mode, the firmware sends nothing at all.
+- After the host explicitly sets mouse mode, it sends mouse reports, but their values look garbled and macOS ignores them anyway.
+- In Precision Touchpad mode (feature report 3 set to 3), it sends clean multi-finger reports, which macOS cannot interpret.
+
+This helper switches the pad to Precision Touchpad mode, reads the finger reports, and posts cursor, click, and scroll events itself.
+
+## Gestures
+
+| Gesture | Action |
+| --- | --- |
+| One finger | Move the pointer |
+| Tap | Left click (tap again quickly for a double click) |
+| Tap, then touch again and slide | Drag; after a lift the item stays held for a second, so touch again to keep dragging or tap to drop it |
+| Two-finger tap | Right click |
+| Three-finger tap | Middle click |
+| Two-finger slide | Scroll, following the system's natural-scrolling setting |
+| Three-finger swipe up | Mission Control |
+| Three-finger swipe down | App Exposé |
+| Three-finger swipe left or right | Move to the Space on the right or left |
+
+The pad has no physical button.
+
+Three-finger swipes send the same Dock gesture events as Apple's trackpads, so Spaces and Mission Control follow the fingers and hold wherever they stop.
+Lifting finishes the swipe, unless the fingers were heading back toward where they started, which snaps it back.
+These events come from private macOS functions.
+If an update removes them, swipes fall back to the Mission Control keyboard shortcuts (Control with an arrow key), fired once the fingers travel 10 mm, with no animation following the fingers.
+That fallback needs the shortcuts enabled in System Settings → Keyboard → Keyboard Shortcuts → Mission Control.
+
+## Install
+
+```sh
+make install            # or: make install SPEED=1.2 VERBOSE=1
+```
+
+`VERBOSE=1` logs every touch: taps, drags, and per-movement pointer statistics.
+
+This installs `~/.local/bin/htx-touchpad` and the login agent `~/Library/LaunchAgents/xyz.attacktive.htx-touchpad.plist`, then starts it.
+
+Then grant two permissions in System Settings → Privacy & Security, adding `~/.local/bin/htx-touchpad` with **+** and **⌘⇧G** (not the copy in `build/`):
+
+- **Input Monitoring**, to read the pad. The helper does not notice this grant while running, so run `make restart` afterwards.
+- **Accessibility**, to move the pointer. The helper restarts itself within about 10 seconds of this grant.
+
+## Rebuilding
+
+The build signs the binary with the first valid code-signing identity in the keychain (override with `SIGN_IDENTITY=<hash>`), so permissions survive rebuilds.
+
+Without an identity it falls back to ad-hoc signing, which pins both permissions to one exact build.
+In that case, after installing changed code, remove both entries in Privacy & Security and add them again.
+
+Changing only `SPEED` reinstalls the same binary and keeps the permissions either way.
+
+## Pointer acceleration
+
+The acceleration curve is copied from Apple's: cursor points per mm of finger travel, by finger speed, measured on the built-in trackpad of a 14-inch MacBook Pro (Mac16,8) at Tracking speed 1.0.
+It runs from 3 pt/mm when nearly still to about 61 pt/mm for a flick at 850 mm/s and beyond.
+
+The pointer also follows the Trackpad "Tracking speed" slider in System Settings, read at the start of every touch.
+The slider's 0–3 range maps linearly onto a multiplier from 0.25 to 2.5, which is 1 at the 1.0 notch, applied to the whole curve along with `SPEED`.
+At 1.0 the curve matches Apple's; at other notches it is an approximation, since Apple's curve also changes shape.
+The add-on pad and the built-in trackpad share that one slider.
+
+## Other targets
+
+- `make restart` restarts the helper.
+- `make log` shows the end of `~/Library/Logs/htx-touchpad.log`.
+- `make uninstall` stops the helper and removes the installed files; remove the two Privacy & Security entries by hand.
+
+## Keyboard Setup Assistant
+
+The device also exposes a keyboard interface, which makes macOS open Keyboard Setup Assistant on first connection.
+It is registered as an ANSI keyboard (`"35089-1165-0" = 40` in `/Library/Preferences/com.apple.keyboardtype.plist`), so the assistant stays away.
+
+## Touch report layout
+
+Input report 4 is 30 bytes long:
+
+- Byte 0: report ID.
+- Bytes 1–25: five 5-byte contact slots.
+	- Byte 0 of each slot is flags: bit 0 is confidence, bit 1 is tip switch, and bits 2–4 are the contact ID.
+	- Bytes 1–2 are X (little-endian, 0–1599), and bytes 3–4 are Y (0–1199), over a 117 mm × 88 mm surface.
+- Bytes 26–27: scan time.
+- Byte 28: contact count.
+- Byte 29: buttons.
